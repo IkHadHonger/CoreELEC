@@ -56,3 +56,24 @@ restored byte-for-byte from official CoreELEC `coreelec-22` revision
 `3636aaa649efc5060e89cffb1257e8d36c8792e8`, replacing SamuriHL's samurai artwork.
 The official configuration uses 20 frames per second. This is an artwork-only
 change; SamuriHL's BD-J/playback modifications and the Wi-Fi fixes remain intact.
+
+## Upstream update proposals
+
+`Check SamuriHL updates` runs daily at 07:23 UTC and can also be started manually
+in GitHub Actions. It tracks `SamuriHL/CoreELEC: samurihl-ce22` only, not the
+official CoreELEC RC/nightly branch. If there are new commits, it updates the
+dedicated `updates/samurihl-ce22` proposal branch and opens or refreshes one
+draft pull request targeting `cube3-wifi6e-samurihl-20260928`.
+
+The default branch is never automatically changed. The workflow does not run
+upstream build scripts, approve PRs, merge PRs, or install anything on the Cube.
+It reports merge conflicts and flags merged-tree changes to the stock boot
+artwork or Wi-Fi package configuration. A new build and hardware testing remain
+required before manual merging. Upstream history rewrites fail safely rather
+than force-pushing over the proposal branch.
+
+GitHub Actions must be enabled and its repository setting for creating pull
+requests allowed. General default workflow permissions remain read-only; only
+this proposal job requests contents/write and pull-requests/write. Public
+repositories can have scheduled workflows disabled by GitHub after inactivity;
+check Actions if no scheduled runs appear.

@@ -1,0 +1,33 @@
+name: Check SamuriHL updates
+
+on:
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: samurihl-update-pr
+  cancel-in-progress: false
+
+jobs:
+  propose-update:
+    if: github.repository == 'IkHadHonger/CoreELEC'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Read the customized default branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: cube3-wifi6e-samurihl-20260928
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Propose upstream changes without merging
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/samurihl-update-pr.sh
