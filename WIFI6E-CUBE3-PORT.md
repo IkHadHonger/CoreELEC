@@ -45,6 +45,14 @@ additional firmware change was required.
 - All three distro commits cherry-picked without content conflicts.
 - The resulting diff from the SamuriHL tag is limited to the two mt76 package
   lines, the mt76 power-table install step, this document, and the
-  `linux-amlogic` package pin.
+  `linux-amlogic` package pin (before the requested boot-artwork change below).
 - A full CoreELEC image build still requires the supported Linux build
   environment; Windows is suitable for source and configuration checks only.
+
+## Requested stock boot animation
+
+The Amlogic-no static splash and complete progress-animation directory were
+restored byte-for-byte from official CoreELEC `coreelec-22` revision
+`3636aaa649efc5060e89cffb1257e8d36c8792e8`, replacing SamuriHL's samurai artwork.
+The official configuration uses 20 frames per second. This is an artwork-only
+change; SamuriHL's BD-J/playback modifications and the Wi-Fi fixes remain intact.
