@@ -1,0 +1,3221 @@
+From: SamuriHL <samurihl@gmail.com>
+Date: Sun, 11 Oct 2026 17:27:59 -0400
+Subject: [PATCH] disc time: one process-lifetime disc clock on the timeline
+
+Phase 5 step 5.D sub-steps 1-3 (design sec. 18.6-18.8), with the
+code review's fixes.
+
+1. The disc clock (C) and its natives.
+
+A static clock in util/time.c (not in the BLURAY object, so lingering
+xlet threads never read freed memory), guarded by its own small mutex
+(never bd->mutex). Disc ns run from the first use in the process and
+never go back, across discs too. bd_disc_clock_start() (a playback
+open only) records the disc ns and wall time at the disc's start, for
+BD-J millis; the wall ms recorded is max(wall now, the millis the clock
+returns now), so millis never go back across discs when the wall clock
+was stepped back between them. bd_disc_clock_set(running, at_mono_ns)
+freezes at now or runs from an instant that may be in the future
+(readers apply max(0, now - anchor), so the clock stays frozen until
+that instant and starts exactly there); a past run instant runs at now.
+
+Every write also records a segment {from_mono, anchor_mono,
+anchor_disc, running} in a ring of the last 8. disc_time_at(t) uses the
+latest segment in force at t (from_mono = the write's instant <= t), so
+an instant before the latest write (patch 17's start conversion, up to
+~100 ms after T0) is not moved by a freeze or run written in between,
+and a pending future RUN keeps it frozen until its anchor. Instants
+older than the ring use the oldest segment, counted (DISCDIAG TEMP).
+
+The graphics controller's eight bd_get_scr() reads use the disc clock
+in 90 kHz units (bd_get_scr() when disc time is off).
+
+Static natives Libbluray.discTimeNanosN(), discTimeAtN(long monoNs) and
+discTimeMillisN() read the clock with no BLURAY pointer.
+
+BLURAY_PLAYER_SETTING_DISC_TIME_OFF (process-wide, before playback):
+the clock never freezes, the graphics controller keeps bd_get_scr(),
+and libbluray sets the Java property bluray.disctime.off on every BD-J
+start before Libbluray.init.
+
+Rule: the clock mutex guards a copy of a few words; nothing logs, calls
+into Java or takes another lock under it.
+
+DISCDIAG TEMP: every clock write is logged.
+
+2. BD-J helpers, DiscTimer and the source changes.
+
+org.videolan.DiscTime: currentTimeMillis() (no synchronized: the
+native's mutex is the barrier), nanoTime(), sleep(J)/(JI),
+waitOn(Object,J)/(Object,J,I) and joinOn(Thread,J)/(Thread,J,I) with
+the JDK 8u462 checks and semantics: IllegalArgumentException (and the
+NullPointerException of a null receiver) before any monitor is touched;
+sleep(0), wait(0,0) and join(0) passed through; wait(0,n>0) a 1 ms wait;
+the JDK's own IllegalMonitorStateException and InterruptedException.
+Waits run on wall time towards the disc deadline: a wall wait that ends
+with disc time short waits again, in slices of min(remaining, 50) ms
+only while frozen; a remainder rounds up (never a wait(0)); deadlines
+saturate. waitOn returns at once on an early wake; a notify coinciding
+with a wall timeout during a freeze is lost until the disc deadline
+(inherent to wait(J)), counted.
+
+org.videolan.DiscTimer / DiscTimerTask: java.util.Timer / TimerTask
+(OpenJDK 8 semantics) on disc ms, not final, the timer thread created
+in the caller's thread group. The queue loop waits on its own queue with
+a wall timeout of the disc time left and re-checks, in slices of at most
+50 ms only while frozen.
+
+In source, each taking the off flag (bluray.disctime.off, re-read at
+every Libbluray.init): TVTimerImpl on DiscTimer and disc time for
+absolute specs; SystemTimeBase is disc nanoseconds (no lazy wall start);
+ImageFrameAccurateAnimation's sleep(40) -> DiscTime.sleep; the
+org.dvb.event UserEvent `when` from DiscTime.currentTimeMillis; patch
+17's start conversion uses Libbluray.discTimeAt(startNs). Off: every
+helper is the JDK call it replaces and each source change is today's
+code.
+
+Left on wall time: BDRootWindow's 40 ms flush timer, the xlet stop and
+5 s disposal waits, patch 17's poll timer, pendingSince and 15 s limit,
+and the AWT key/mouse event `when` (java.awt.BDJHelper): JDK 8's
+type-ahead markers compare it against wall-stamped invokeLater events,
+so a disc-stamped key after a freeze would go to the old focus owner.
+
+DISCDIAG TEMP: per-kind counters (sleep frozen waits and slices, waitOn
+early wakes / timeouts / re-waits / timeouts after a freeze, joinOn,
+DiscTimer firings and frozen re-checks), logged at most once per 10 s,
+at xlet shutdown and before the next disc's start (then reset).
+
+3. The disc class patcher and one define path.
+
+org.videolan.DiscClassPatcher (ASM 5.0.4: ClassReader EXPAND_FRAMES,
+ClassWriter flags 0, debug info kept), built in the BDJXletContext
+constructor for BDJClassLoader and in DVBClassLoader's URLClassLoader:
+- invokestatic java/lang/System.currentTimeMillis()J / nanoTime()J ->
+  DiscTime;
+- invokestatic sleep(J)V / (JI)V -> DiscTime.sleep, and
+  invokevirtual/special/interface wait(J)V / (JI)V -> DiscTime.waitOn,
+  join(J)V / (JI)V -> DiscTime.joinOn (static, the receiver is the first
+  argument: same operand stack), only when the call resolves to the JDK
+  method: no disc class on the owner's superclass chain declares the
+  name and descriptor, and the chain reaches java/lang/Thread (sleep,
+  join). The chain is read from the loader's own class bytes, never by
+  loading; the first class outside them is resolved through the system
+  class loader (JDK / libbluray only; DVBClassLoader walks on through a
+  disc parent's bytes). Anything unresolved is left unchanged.
+- only for classes whose constant pool names java/util/Timer* (pre-scan
+  of every Utf8 entry, descriptors and signatures included):
+  RemappingClassAdapter java/util/Timer -> org/videolan/DiscTimer,
+  java/util/TimerTask -> org/videolan/DiscTimerTask (subclasses and
+  their super.<init> calls included). Other classes never pass through
+  the remapper's LocalVariablesSorter.
+- a class with no rewrite is defined from its original bytes.
+
+org.videolan.DiscClassDefiner: one define path for every disc class
+(patched, unchanged, stripped): the 5-argument defineClass with a
+CodeSource of JarURLConnection.getJarFileURL() and the entry's code
+signers read after the entry is read to EOF, definePackage from the jar
+manifest with URLClassLoader's sealing check; directory AppCaches: the
+classpath directory URL, no signers, no manifest. The jars are read
+through the definer's own JarFiles (closed with the loader), never the
+JarURLConnection cache, which would outlive the loader and serve a
+stale jar to a later disc with the same jar path. A class with broken
+debug info is patched with it dropped; a ClassFormatError from
+defineClass retries once stripped (BDJClassFileTransformer.strip),
+patched again (DVBClassLoader gains this fallback). A class the patcher
+cannot parse is defined unpatched with an ERROR, except one that names
+the Timer types, which fails with an ERROR naming it.
+
+Off (bluray.disctime.off): no patcher and no definer; BDJClassLoader's
+findClass, its strip path and the Evangelion ReplaceMethodPatcher are
+today's, and DVBClassLoader is today's. On: the Evangelion patcher is
+not installed (DiscTime.currentTimeMillis goes through the native's
+mutex, the barrier it needed).
+
+DISCDIAG TEMP: per loader, a line per jar at its first class (signed,
+manifest, sealed) and a summary (classes, patched, timer_remapped,
+stripped, debug_dropped, signed, counts by rewrite kind, calls kept as
+overrides / unresolved, "java.util.Timer" strings, failures by class)
+after the xlet class load, at xlet shutdown and at most once per 10 s.
+
+
+---
+diff --git a/src/libbluray/bdj/bdj.c b/src/libbluray/bdj/bdj.c
+index 3d726e8b..409cf82b 100644
+--- a/src/libbluray/bdj/bdj.c
++++ b/src/libbluray/bdj/bdj.c
+@@ -32,6 +32,7 @@
+ #include "util/strutl.h"
+ #include "util/macro.h"
+ #include "util/logging.h"
++#include "util/time.h"
+ 
+ 
+ #include <jni.h>
+@@ -767,6 +768,41 @@ static int _get_method(JNIEnv *env, jclass *cls, jmethodID *method_id,
+     return 1;
+ }
+ 
++/* System.setProperty(key, value); exceptions are logged and cleared */
++static void _bdj_set_property(JNIEnv *env, const char *key, const char *value)
++{
++    jclass sys_class;
++    jmethodID set_id;
++
++    if (!_get_method(env, &sys_class, &set_id,
++                     "java/lang/System", "setProperty",
++                     "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;")) {
++        return;
++    }
++
++    jstring jkey = (*env)->NewStringUTF(env, key);
++    jstring jval = (*env)->NewStringUTF(env, value);
++    if (jkey && jval) {
++        jobject old = (*env)->CallStaticObjectMethod(env, sys_class, set_id, jkey, jval);
++        if (old) {
++            (*env)->DeleteLocalRef(env, old);
++        }
++    }
++    if ((*env)->ExceptionOccurred(env)) {
++        (*env)->ExceptionDescribe(env);
++        BD_DEBUG(DBG_BDJ | DBG_CRIT, "Failed to set property %s\n", key);
++        (*env)->ExceptionClear(env);
++    }
++
++    if (jkey) {
++        (*env)->DeleteLocalRef(env, jkey);
++    }
++    if (jval) {
++        (*env)->DeleteLocalRef(env, jval);
++    }
++    (*env)->DeleteLocalRef(env, sys_class);
++}
++
+ static int _bdj_init(JNIEnv *env, struct bluray *bd, const char *disc_root, const char *bdj_disc_id,
+                      BDJ_CONFIG *storage)
+ {
+@@ -774,6 +810,15 @@ static int _bdj_init(JNIEnv *env, struct bluray *bd, const char *disc_root, cons
+         BD_DEBUG(DBG_BDJ | DBG_CRIT, "Couldn't register native methods.\n");
+     }
+ 
++    /* disc time off switch, set on every BD-J start before any xlet
++     * context exists (the JVM is shared by later discs, so not a -D) */
++    {
++        int off = disc_clock_off();
++        _bdj_set_property(env, "bluray.disctime.off", off ? "true" : "false");
++        /* DISCDIAG TEMP */
++        BD_DEBUG(DBG_BDJ | DBG_CRIT, "DISCDIAG TEMP bluray.disctime.off=%s\n", off ? "true" : "false");
++    }
++
+     // initialize class org.videolan.Libbluray
+     jclass init_class;
+     jmethodID init_id;
+diff --git a/src/libbluray/bdj/java/javax/media/SystemTimeBase.java b/src/libbluray/bdj/java/javax/media/SystemTimeBase.java
+index a6e2d665..fb8ac591 100644
+--- a/src/libbluray/bdj/java/javax/media/SystemTimeBase.java
++++ b/src/libbluray/bdj/java/javax/media/SystemTimeBase.java
+@@ -18,6 +18,9 @@
+ 
+ package javax.media;
+ 
++import org.videolan.DiscTime;
++import org.videolan.Libbluray;
++
+ /**
+  * This file is from FMJ (fmj-sf.net)
+  *
+@@ -30,6 +33,13 @@ public final class SystemTimeBase implements TimeBase {
+     private static long start = -1L;
+ 
+     public long getNanoseconds() {
++        /* disc time (phase 5): the time base is disc nanoseconds, defined
++         * directly (no lazy start: disc ns never go back, across discs too).
++         * Off: the original wall-time version below. */
++        if (!DiscTime.isOff()) {
++            return Libbluray.discTimeNanos();
++        }
++
+         // This version only has millisecond accuracy.
+ 
+         if (start < 0) {
+diff --git a/src/libbluray/bdj/java/javax/tv/util/TVTimerImpl.java b/src/libbluray/bdj/java/javax/tv/util/TVTimerImpl.java
+index 48705355..f0e84e2b 100644
+--- a/src/libbluray/bdj/java/javax/tv/util/TVTimerImpl.java
++++ b/src/libbluray/bdj/java/javax/tv/util/TVTimerImpl.java
+@@ -23,13 +23,25 @@ import java.util.Timer;
+ import java.util.TimerTask;
+ import java.util.Hashtable;
+ 
++import org.videolan.DiscTime;
++import org.videolan.DiscTimer;
++import org.videolan.DiscTimerTask;
++
+ public class TVTimerImpl extends TVTimer
+ {
++    /* disc time (phase 5): timers run on disc time, which stays frozen while
++     * the player changes its output. Off: java.util.Timer on wall time. */
++    private final boolean discTime = !DiscTime.isOff();
+     private Timer timer;
+-    private Hashtable scheduledTasks = new Hashtable(); // TVTimerSpec -> TimerTask
++    private DiscTimer discTimer;
++    private Hashtable scheduledTasks = new Hashtable(); // TVTimerSpec -> TimerTask or DiscTimerTask
+ 
+     public TVTimerImpl() {
+-        timer = new Timer(true); // daemon thread
++        if (discTime) {
++            discTimer = new DiscTimer(true); // daemon thread
++        } else {
++            timer = new Timer(true); // daemon thread
++        }
+     }
+ 
+     public TVTimerSpec scheduleTimerSpec(final TVTimerSpec spec)
+@@ -42,7 +54,7 @@ public class TVTimerImpl extends TVTimer
+         deschedule(spec);
+ 
+         final TVTimer self = this;
+-        TimerTask task = new TimerTask() {
++        final Runnable fire = new Runnable() {
+             public void run() {
+                 try {
+                     spec.notifyListeners(self);
+@@ -55,13 +67,27 @@ public class TVTimerImpl extends TVTimer
+                 }
+             }
+         };
++        Object task;
++        if (discTime) {
++            task = new DiscTimerTask() {
++                public void run() {
++                    fire.run();
++                }
++            };
++        } else {
++            task = new TimerTask() {
++                public void run() {
++                    fire.run();
++                }
++            };
++        }
+ 
+         scheduledTasks.put(spec, task);
+ 
+         long delay = spec.getTime();
+         if (spec.isAbsolute()) {
+             // Absolute time - calculate delay from current time
+-            long now = System.currentTimeMillis();
++            long now = discTime ? DiscTime.currentTimeMillis() : System.currentTimeMillis();
+             delay = spec.getTime() - now;
+             if (delay < 0) {
+                 delay = 0; // Fire immediately if time has passed
+@@ -74,9 +100,17 @@ public class TVTimerImpl extends TVTimer
+                 if (period <= 0) {
+                     period = 1; // Minimum 1ms period
+                 }
+-                timer.scheduleAtFixedRate(task, delay, period);
++                if (discTime) {
++                    discTimer.scheduleAtFixedRate((DiscTimerTask) task, delay, period);
++                } else {
++                    timer.scheduleAtFixedRate((TimerTask) task, delay, period);
++                }
+             } else {
+-                timer.schedule(task, delay);
++                if (discTime) {
++                    discTimer.schedule((DiscTimerTask) task, delay);
++                } else {
++                    timer.schedule((TimerTask) task, delay);
++                }
+             }
+         } catch (Exception e) {
+             scheduledTasks.remove(spec);
+@@ -96,15 +130,21 @@ public class TVTimerImpl extends TVTimer
+ 
+     public void deschedule(TVTimerSpec spec) {
+         if (spec != null) {
+-            TimerTask task = (TimerTask) scheduledTasks.remove(spec);
+-            if (task != null) {
+-                task.cancel();
++            Object task = scheduledTasks.remove(spec);
++            if (task instanceof DiscTimerTask) {
++                ((DiscTimerTask) task).cancel();
++            } else if (task != null) {
++                ((TimerTask) task).cancel();
+             }
+         }
+     }
+ 
+     public void shutdown() {
+-        timer.cancel();
++        if (discTime) {
++            discTimer.cancel();
++        } else {
++            timer.cancel();
++        }
+         scheduledTasks.clear();
+     }
+ }
+diff --git a/src/libbluray/bdj/java/org/bluray/ui/ImageFrameAccurateAnimation.java b/src/libbluray/bdj/java/org/bluray/ui/ImageFrameAccurateAnimation.java
+index ee01aa67..9c44e7a4 100644
+--- a/src/libbluray/bdj/java/org/bluray/ui/ImageFrameAccurateAnimation.java
++++ b/src/libbluray/bdj/java/org/bluray/ui/ImageFrameAccurateAnimation.java
+@@ -32,6 +32,7 @@ import java.lang.Thread;
+ 
+ import java.awt.BDWindowGraphics;
+ 
++import org.videolan.DiscTime;
+ import org.videolan.GUIManager;
+ import org.videolan.Logger;
+ 
+@@ -212,7 +213,7 @@ public class ImageFrameAccurateAnimation extends FrameAccurateAnimation
+                 }
+                 for (; !ready && count > 0; count--) {
+                     try {
+-                        Thread.sleep(40);
++                        DiscTime.sleep(40); // disc time (phase 5); Thread.sleep when off
+                     } catch (InterruptedException e) {
+                         return;
+                     }
+diff --git a/src/libbluray/bdj/java/org/dvb/event/EventManager.java b/src/libbluray/bdj/java/org/dvb/event/EventManager.java
+index dff33d37..73e85532 100644
+--- a/src/libbluray/bdj/java/org/dvb/event/EventManager.java
++++ b/src/libbluray/bdj/java/org/dvb/event/EventManager.java
+@@ -31,6 +31,7 @@ import org.davic.resources.ResourceStatusEvent;
+ import org.davic.resources.ResourceStatusListener;
+ import org.videolan.BDJAction;
+ import org.videolan.BDJXletContext;
++import org.videolan.DiscTime;
+ import org.videolan.Logger;
+ 
+ public class EventManager implements ResourceServer {
+@@ -152,7 +153,7 @@ public class EventManager implements ResourceServer {
+     }
+ 
+     public boolean receiveKeyEventN(int type, int modifiers, int keyCode) {
+-        UserEvent ue = new UserEvent(this, 1, type, keyCode, modifiers, System.currentTimeMillis());
++        UserEvent ue = new UserEvent(this, 1, type, keyCode, modifiers, DiscTime.currentTimeMillis());
+         BDJXletContext context = BDJXletContext.getFocusContext();
+         boolean result = false;
+ 
+diff --git a/src/libbluray/bdj/java/org/dvb/lang/DVBClassLoader.java b/src/libbluray/bdj/java/org/dvb/lang/DVBClassLoader.java
+index 905c610c..65263339 100644
+--- a/src/libbluray/bdj/java/org/dvb/lang/DVBClassLoader.java
++++ b/src/libbluray/bdj/java/org/dvb/lang/DVBClassLoader.java
+@@ -26,6 +26,9 @@ import java.security.PermissionCollection;
+ import java.util.Enumeration;
+ import java.util.jar.Manifest;
+ 
++import org.videolan.DiscClassDefiner;
++import org.videolan.DiscClassPatcher;
++
+ import java.security.AccessController;
+ import java.security.PrivilegedAction;
+ 
+@@ -101,16 +104,65 @@ public abstract class DVBClassLoader extends java.security.SecureClassLoader {
+     protected static class DVBURLClassLoader extends URLClassLoader {
+         public DVBURLClassLoader(URL[] urls) {
+             super(urls);
++            definer = createDefiner(null);
+         }
+ 
+         public DVBURLClassLoader(URL[] urls, ClassLoader parent) {
+             super(urls, parent);
++            definer = createDefiner(parent);
++        }
++
++        /* disc time (phase 5): every disc class through the one define
++         * path of the disc class patcher; null when disc time is off */
++        private final DiscClassDefiner definer;
++
++        private DiscClassDefiner createDefiner(final ClassLoader parent) {
++            DiscClassPatcher p = DiscClassPatcher.create();
++            if (p == null)
++                return null;
++            return new DiscClassDefiner(p, "DVBClassLoader") {
++                protected URL findOwnResource(String path) {
++                    return findOwnResourceQuiet(path);
++                }
++                protected URL findOuterDiscResource(String path) {
++                    return parent != null ? parent.getResource(path) : null;
++                }
++                protected URL[] getClassPath() {
++                    return getURLs();
++                }
++                protected Package getPkg(String name) {
++                    return getPackage(name);
++                }
++                protected Package definePkg(String name, Manifest man, URL url) {
++                    return definePackage(name, man, url);
++                }
++                protected Package definePkg(String name, String specTitle, String specVersion, String specVendor,
++                                            String implTitle, String implVersion, String implVendor, URL sealBase) {
++                    return definePackage(name, specTitle, specVersion, specVendor,
++                                         implTitle, implVersion, implVendor, sealBase);
++                }
++                protected Class define(String name, byte[] b, CodeSource cs) {
++                    return defineClass(name, b, 0, b.length, cs);
++                }
++            };
++        }
++
++        private URL findOwnResourceQuiet(String path) {
++            return super.findResource(path);
+         }
+ 
+         protected Class findClass(String name) throws ClassNotFoundException {
++            if (definer != null)
++                return definer.findClass(name);
+             return super.findClass(name);
+         }
+ 
++        public void close() throws IOException {
++            if (definer != null)
++                definer.close();
++            super.close();
++        }
++
+         protected Package definePackage(String name, Manifest man, URL url)
+                         throws IllegalArgumentException {
+             return super.definePackage(name, man, url);
+diff --git a/src/libbluray/bdj/java/org/videolan/BDJClassLoader.java b/src/libbluray/bdj/java/org/videolan/BDJClassLoader.java
+index b10451c6..2c5337ab 100644
+--- a/src/libbluray/bdj/java/org/videolan/BDJClassLoader.java
++++ b/src/libbluray/bdj/java/org/videolan/BDJClassLoader.java
+@@ -27,9 +27,11 @@ import java.io.InputStream;
+ import java.io.IOException;
+ import java.net.URL;
+ import java.net.URLClassLoader;
++import java.security.CodeSource;
+ import java.util.ArrayList;
+ import java.util.Enumeration;
+ import java.util.Map;
++import java.util.jar.Manifest;
+ 
+ import java.security.AccessController;
+ import java.security.PrivilegedAction;
+@@ -40,7 +42,8 @@ import org.videolan.bdjo.AppCache;
+ 
+ class BDJClassLoader extends URLClassLoader {
+     public static BDJClassLoader newInstance(AppCache[] appCaches, String basePath, String classPathExt, final String xletClass,
+-                                             final BDJClassFilePatcher patcher) {
++                                             final BDJClassFilePatcher patcher,
++                                             final DiscClassPatcher discPatcher) {
+         ArrayList classPath = new ArrayList();
+         URL url = translateClassPath(appCaches, basePath, null);
+         if (url != null)
+@@ -56,7 +59,7 @@ class BDJClassLoader extends URLClassLoader {
+         return (BDJClassLoader)AccessController.doPrivileged(
+                 new PrivilegedAction() {
+                     public Object run() {
+-                        return new BDJClassLoader(urls, xletClass, patcher);
++                        return new BDJClassLoader(urls, xletClass, patcher, discPatcher);
+                     }
+                 });
+     }
+@@ -116,7 +119,8 @@ class BDJClassLoader extends URLClassLoader {
+         }
+     }
+ 
+-    private BDJClassLoader(URL[] urls, String xletClass, BDJClassFilePatcher patcher) {
++    private BDJClassLoader(URL[] urls, String xletClass, BDJClassFilePatcher patcher,
++                           DiscClassPatcher discPatcher) {
+         super(urls);
+         this.xletClass = xletClass;
+ 
+@@ -127,11 +131,62 @@ class BDJClassLoader extends URLClassLoader {
+             xletClasses = a.getXletClasses();
+         }
+         this.patcher = patcher;
++
++        /* disc time on: every disc class through the one define path */
++        if (discPatcher != null)
++            definer = new Definer(discPatcher, "BDJClassLoader(" + xletClass + ")");
++        else
++            definer = null;
++    }
++
++    private final class Definer extends DiscClassDefiner {
++        Definer(DiscClassPatcher p, String name) {
++            super(p, name);
++        }
++        protected URL findOwnResource(String path) {
++            return findOwnResourceQuiet(path);
++        }
++        protected URL[] getClassPath() {
++            return getURLs();
++        }
++        protected Package getPkg(String name) {
++            return getPackage(name);
++        }
++        protected Package definePkg(String name, Manifest man, URL url) {
++            return definePackage(name, man, url);
++        }
++        protected Package definePkg(String name, String specTitle, String specVersion, String specVendor,
++                                    String implTitle, String implVersion, String implVendor, URL sealBase) {
++            return definePackage(name, specTitle, specVersion, specVendor, implTitle, implVersion, implVendor, sealBase);
++        }
++        protected Class define(String name, byte[] b, CodeSource cs) {
++            return defineClass(name, b, 0, b.length, cs);
++        }
++    }
++
++    private URL findOwnResourceQuiet(String path) {
++        return super.findResource(path);
++    }
++
++    /* DISCDIAG TEMP */
++    protected void discDiagReport(String why) {
++        if (definer != null)
++            definer.report(why);
++    }
++
++    public void close() throws IOException {
++        if (definer != null)
++            definer.close();
++        super.close();
+     }
+ 
+     protected Xlet loadXlet() throws ClassNotFoundException,
+             IllegalAccessException, InstantiationException {
+-        return (Xlet)loadClass(xletClass).newInstance();
++        try {
++            return (Xlet)loadClass(xletClass).newInstance();
++        } finally {
++            discDiagReport("xlet loaded");
++        }
+     }
+ 
+     protected void update(AppCache[] appCaches, String basePath, String classPathExt, String xletClass) {
+@@ -150,6 +205,8 @@ class BDJClassLoader extends URLClassLoader {
+         }
+         for (int i = 0; i < classPath.size(); i++)
+             addURL((URL)classPath.get(i));
++        if (definer != null)
++            definer.classPathChanged();
+         this.xletClass = xletClass;
+     }
+ 
+@@ -253,6 +310,11 @@ class BDJClassLoader extends URLClassLoader {
+ 
+     protected Class findClass(String name) throws ClassNotFoundException {
+ 
++        /* disc time on: no other patcher, one define path */
++        if (definer != null) {
++            return definer.findClass(name);
++        }
++
+         if (patcher != null) {
+             try {
+                 byte[] b = loadClassCode(name);
+@@ -335,6 +397,7 @@ class BDJClassLoader extends URLClassLoader {
+     private String xletClass;
+ 
+     private final BDJClassFilePatcher patcher;
++    private final DiscClassDefiner definer;  /* null when disc time is off */
+     private Map hideClasses;  /* classes that should be hidden from Xlet */
+     private Map bootClasses;  /* additional bootstrap classes */
+     private Map xletClasses;  /* fallback for possibly missing classes */
+diff --git a/src/libbluray/bdj/java/org/videolan/BDJXletContext.java b/src/libbluray/bdj/java/org/videolan/BDJXletContext.java
+index 0f47a87f..415aa267 100644
+--- a/src/libbluray/bdj/java/org/videolan/BDJXletContext.java
++++ b/src/libbluray/bdj/java/org/videolan/BDJXletContext.java
+@@ -45,8 +45,14 @@ public class BDJXletContext implements javax.tv.xlet.XletContext, javax.microedi
+     public BDJXletContext(AppEntry entry, AppCache[] caches, Container container) {
+         BDJClassFilePatcher patcher = null;
+ 
++        /* disc time (phase 5): the disc class patcher, null when off */
++        DiscClassPatcher discPatcher = DiscClassPatcher.create();
++
+         /* Disc-specific fixes */
+-        if (org.bluray.ti.DiscManager.getDiscManager().getCurrentDisc().getId().equals("00000000000000000000000000000000")) {
++        /* disc time on: DiscTime.currentTimeMillis replaces the Evangelion
++         * fix (the native's mutex is the barrier it needed) */
++        if (discPatcher == null &&
++            org.bluray.ti.DiscManager.getDiscManager().getCurrentDisc().getId().equals("00000000000000000000000000000000")) {
+             if (entry.getIdentifier().getOID() == 0xffff27dd && entry.getIdentifier().getAID() == 0x1212 && entry.getInitialClass().equals("PlayMenuMain")) {
+                 // "Evangelion, You are (not) alone"
+                 // Disc uses unsynchronized flag to signal loading complete. Flag is read in busy loop, checking for timeout.
+@@ -63,7 +69,8 @@ public class BDJXletContext implements javax.tv.xlet.XletContext, javax.microedi
+                 entry.getBasePath(),
+                 entry.getClassPathExt(),
+                 entry.getInitialClass(),
+-                patcher);
++                patcher,
++                discPatcher);
+         this.container = container;
+ 
+         this.threadGroup = BDJThreadGroup.create(Integer.toHexString(appid.getOID()) + "." +
+@@ -516,6 +523,10 @@ public class BDJXletContext implements javax.tv.xlet.XletContext, javax.microedi
+ 
+         threadGroup.stopAll(1000);
+ 
++        /* DISCDIAG TEMP */
++        DiscTime.diagReport("xlet shutdown");
++        loader.discDiagReport("xlet shutdown");
++
+         try {
+             Method m;
+             m = loader.getClass().getMethod("close", new Class[0]);
+diff --git a/src/libbluray/bdj/java/org/videolan/DiscClassDefiner.java b/src/libbluray/bdj/java/org/videolan/DiscClassDefiner.java
+new file mode 100644
+index 00000000..1a989cb2
+--- /dev/null
++++ b/src/libbluray/bdj/java/org/videolan/DiscClassDefiner.java
+@@ -0,0 +1,518 @@
++/*
++ * This file is part of libbluray
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++package org.videolan;
++
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.io.IOException;
++import java.io.InputStream;
++import java.net.JarURLConnection;
++import java.net.URL;
++import java.net.URLConnection;
++import java.security.AccessController;
++import java.security.CodeSigner;
++import java.security.CodeSource;
++import java.security.PrivilegedAction;
++import java.security.PrivilegedActionException;
++import java.security.PrivilegedExceptionAction;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Iterator;
++import java.util.jar.Attributes;
++import java.util.jar.JarEntry;
++import java.util.jar.JarFile;
++import java.util.jar.Manifest;
++
++/*
++ * Disc time (phase 5): the one define path for every disc class of a loader
++ * (BDJClassLoader, DVBClassLoader's URLClassLoader) while disc time is on.
++ *
++ * Patched, unchanged and stripped classes are all defined the same way, as
++ * URLClassLoader does: the 5-argument defineClass with a CodeSource of the
++ * classpath jar URL (JarURLConnection.getJarFileURL()) and the entry's code
++ * signers (read after the entry was read to EOF), and definePackage from
++ * the jar manifest with URLClassLoader's sealing check. Directory
++ * AppCaches: the directory URL, no signers, no manifest.
++ *
++ * A class the patcher cannot parse is defined unpatched with an ERROR;
++ * one whose constant pool names the Timer types fails (ERROR naming it),
++ * since an unremapped class next to remapped ones would give LinkageError.
++ * A ClassFormatError from defineClass retries once with debug info
++ * stripped (BDJClassFileTransformer.strip), patched again.
++ *
++ * The loader implements the hooks; the definer calls them only from
++ * findClass (the loader's lock is held: neither loader is parallel
++ * capable).
++ */
++public abstract class DiscClassDefiner implements DiscClassPatcher.Resolver {
++
++    protected DiscClassDefiner(DiscClassPatcher patcher, String loaderName) {
++        this.patcher = patcher;
++        this.loaderName = loaderName;
++    }
++
++    /* the loader's own resource (its URLs only, no parent) */
++    protected abstract URL findOwnResource(String path);
++    /* the loader's classpath URLs */
++    protected abstract URL[] getClassPath();
++    protected abstract Package getPkg(String name);
++    protected abstract Package definePkg(String name, Manifest man, URL url);
++    protected abstract Package definePkg(String name, String specTitle, String specVersion, String specVendor,
++                                         String implTitle, String implVersion, String implVendor, URL sealBase);
++    /* the 5-argument SecureClassLoader.defineClass */
++    protected abstract Class define(String name, byte[] b, CodeSource cs);
++
++    /* a class outside this loader's jars that may still be a disc class
++     * (DVBClassLoader with a disc parent): its bytes' URL, never loaded */
++    protected URL findOuterDiscResource(String path) {
++        return null;
++    }
++
++    /* the loader's classpath changed: drop the class info cache */
++    public synchronized void classPathChanged() {
++        infoCache.clear();
++        outerCache.clear();
++    }
++
++    /*
++     * findClass
++     */
++
++    public Class findClass(String name) throws ClassNotFoundException {
++        String path = name.replace('.', '/').concat(".class");
++        URL res = findOwnResource(path);
++        if (res == null)
++            throw new ClassNotFoundException(name);
++
++        Loaded l;
++        try {
++            l = load(res);
++        } catch (IOException e) {
++            logger.error("loading " + name + " failed: " + e);
++            throw new ClassNotFoundException(name);
++        }
++        noteJar(l);
++
++        DiscClassPatcher.Result r = patch(name, l.bytes);
++        Class c;
++        try {
++            definePackageFor(name, l);
++            c = define(name, r.bytes, l.cs);
++        } catch (ClassFormatError ce) {
++            /* broken debug info (Penguins of Madagascar): strip, patch again */
++            logger.error("defining " + name + " failed: " + ce + ", retrying with debug info stripped");
++            byte[] s;
++            try {
++                s = new BDJClassFileTransformer().strip(l.bytes, 0, l.bytes.length);
++                r = patch(name, s);
++                c = define(name, r.bytes, l.cs);
++            } catch (ThreadDeath td) {
++                throw td;
++            } catch (ClassNotFoundException cnfe) {
++                throw cnfe;
++            } catch (Throwable t) {
++                logger.error("Class rewriting failed: " + t);
++                throw new ClassNotFoundException(name);
++            }
++            count(D_STRIPPED, 1);
++        }
++
++        count(D_CLASSES, 1);
++        if (r.kind == DiscClassPatcher.R_PATCHED)
++            count(D_PATCHED, 1);
++        if (r.timerRemapped)
++            count(D_TIMER_REMAPPED, 1);
++        if (l.cs.getCodeSigners() != null)
++            count(D_SIGNED, 1);
++        maybeReport();
++        return c;
++    }
++
++    private DiscClassPatcher.Result patch(String name, byte[] b) throws ClassNotFoundException {
++        DiscClassPatcher.Result r = patcher.patch(name, b, this);
++        synchronized (this) {
++            for (int i = 0; i < DiscClassPatcher.K_COUNT; i++)
++                kinds[i] += r.counts[i];
++        }
++        if (r.kind == DiscClassPatcher.R_FAILED) {
++            logger.error("DISCDIAG TEMP disc time: class " + name + " names java.util.Timer/TimerTask and cannot be" +
++                         " remapped, not defined: " + r.error);
++            fail(name, "timer_unparseable");
++            throw new ClassNotFoundException(name);
++        }
++        if (r.kind == DiscClassPatcher.R_UNPARSEABLE) {
++            logger.error("DISCDIAG TEMP disc time: class " + name + " cannot be patched, defined unpatched: " + r.error);
++            fail(name, "unpatched");
++        }
++        if (r.debugDropped) {
++            logger.error("class " + name + " patched with its debug info dropped (unparseable)");
++            count(D_DEBUG_DROPPED, 1);
++        }
++        return r;
++    }
++
++    /*
++     * one define path
++     */
++
++    private static final class Loaded {
++        byte[] bytes;
++        CodeSource cs;
++        Manifest man;   /* null for a directory */
++        URL url;        /* jar file / directory URL */
++    }
++
++    private Loaded load(final URL res) throws IOException {
++        try {
++            return (Loaded)AccessController.doPrivileged(new PrivilegedExceptionAction() {
++                    public Object run() throws IOException {
++                        return loadPrivileged(res);
++                    }
++                });
++        } catch (PrivilegedActionException e) {
++            throw (IOException)e.getException();
++        }
++    }
++
++    private Loaded loadPrivileged(URL res) throws IOException {
++        Loaded l = new Loaded();
++        CodeSigner[] signers = null;
++        URLConnection uc = res.openConnection();  /* does not connect */
++        if (uc instanceof JarURLConnection) {
++            /* our own JarFile, as URLClassLoader's: the JarURLConnection
++             * cache would keep it open past the loader and serve a stale
++             * jar to a later disc with the same jar path */
++            JarURLConnection juc = (JarURLConnection)uc;
++            l.url = juc.getJarFileURL();
++            JarFile jf = jarFile(l.url);
++            JarEntry je = jf.getJarEntry(juc.getEntryName());
++            if (je == null)
++                throw new IOException("no entry " + juc.getEntryName() + " in " + l.url);
++            /* signers exist only once the entry was read to EOF */
++            l.bytes = readAll(jf.getInputStream(je));
++            signers = je.getCodeSigners();
++            l.man = jf.getManifest();
++        } else {
++            l.bytes = readAll(uc.getInputStream());
++            l.url = classPathEntryFor(res);
++        }
++        l.cs = new CodeSource(l.url, signers);
++        return l;
++    }
++
++    private byte[] readBytesPrivileged(URL res) throws IOException {
++        URLConnection uc = res.openConnection();
++        if (uc instanceof JarURLConnection) {
++            JarURLConnection juc = (JarURLConnection)uc;
++            JarFile jf = jarFile(juc.getJarFileURL());
++            JarEntry je = jf.getJarEntry(juc.getEntryName());
++            if (je == null)
++                return null;
++            return readAll(jf.getInputStream(je));
++        }
++        return readAll(uc.getInputStream());
++    }
++
++    private final HashMap jarFiles = new HashMap(); /* jar file URL string -> JarFile */
++
++    private synchronized JarFile jarFile(URL jarFileURL) throws IOException {
++        String key = jarFileURL.toExternalForm();
++        JarFile jf = (JarFile)jarFiles.get(key);
++        if (jf == null) {
++            if (closed)
++                throw new IOException("loader closed");
++            if (!"file".equals(jarFileURL.getProtocol()))
++                throw new IOException("not a local jar: " + key);
++            String path = jarFileURL.getFile().replace('/', File.separatorChar);
++            path = decodePercent(path);
++            jf = new JarFile(new File(path), true);
++            jarFiles.put(key, jf);
++        }
++        return jf;
++    }
++
++    /* %xx only, as URLClassLoader's ParseUtil.decode ('+' stays) */
++    private static String decodePercent(String s) throws IOException {
++        if (s.indexOf('%') < 0)
++            return s;
++        ByteArrayOutputStream os = new ByteArrayOutputStream();
++        for (int i = 0; i < s.length(); i++) {
++            char c = s.charAt(i);
++            if (c == '%' && i + 2 < s.length()) {
++                try {
++                    os.write(Integer.parseInt(s.substring(i + 1, i + 3), 16));
++                } catch (NumberFormatException e) {
++                    throw new IOException("bad URL path " + s);
++                }
++                i += 2;
++            } else {
++                byte[] b = String.valueOf(c).getBytes("UTF-8");
++                os.write(b, 0, b.length);
++            }
++        }
++        return new String(os.toByteArray(), "UTF-8");
++    }
++
++    private boolean closed = false;
++
++    /* the loader is closed: close the jars */
++    public void close() {
++        synchronized (this) {
++            closed = true;
++            Iterator it = jarFiles.values().iterator();
++            while (it.hasNext()) {
++                try {
++                    ((JarFile)it.next()).close();
++                } catch (IOException e) {
++                }
++            }
++            jarFiles.clear();
++        }
++    }
++
++    /* the classpath directory URL a file: resource came from */
++    private URL classPathEntryFor(URL res) {
++        String s = res.toExternalForm();
++        URL[] cp = getClassPath();
++        URL best = null;
++        for (int i = 0; i < cp.length; i++) {
++            String p = cp[i].toExternalForm();
++            if (s.startsWith(p) && (best == null || p.length() > best.toExternalForm().length()))
++                best = cp[i];
++        }
++        return best != null ? best : res;
++    }
++
++    private static byte[] readAll(InputStream is) throws IOException {
++        try {
++            ByteArrayOutputStream os = new ByteArrayOutputStream();
++            byte[] buffer = new byte[0x4000];
++            int r;
++            while ((r = is.read(buffer)) != -1)
++                os.write(buffer, 0, r);
++            return os.toByteArray();
++        } finally {
++            try {
++                is.close();
++            } catch (IOException e) {
++            }
++        }
++    }
++
++    /* URLClassLoader.defineClass / definePackage / isSealed (JDK 8) */
++    private void definePackageFor(String name, Loaded l) {
++        int i = name.lastIndexOf('.');
++        if (i == -1)
++            return;
++        String pkgname = name.substring(0, i);
++        Package pkg = getPkg(pkgname);
++        if (pkg != null) {
++            if (pkg.isSealed()) {
++                if (!pkg.isSealed(l.url))
++                    throw new SecurityException("sealing violation: package " + pkgname + " is sealed");
++            } else {
++                if ((l.man != null) && isSealed(pkgname, l.man))
++                    throw new SecurityException("sealing violation: can't seal package " + pkgname + ": already loaded");
++            }
++        } else {
++            try {
++                if (l.man != null)
++                    definePkg(pkgname, l.man, l.url);
++                else
++                    definePkg(pkgname, null, null, null, null, null, null, null);
++            } catch (IllegalArgumentException iae) {
++                if (getPkg(pkgname) == null)
++                    throw new AssertionError("Cannot find package " + pkgname);
++            }
++        }
++    }
++
++    private static boolean isSealed(String name, Manifest man) {
++        String path = name.replace('.', '/').concat("/");
++        Attributes attr = man.getAttributes(path);
++        String sealed = null;
++        if (attr != null)
++            sealed = attr.getValue(Attributes.Name.SEALED);
++        if (sealed == null) {
++            if ((attr = man.getMainAttributes()) != null)
++                sealed = attr.getValue(Attributes.Name.SEALED);
++        }
++        return "true".equalsIgnoreCase(sealed);
++    }
++
++    /*
++     * DiscClassPatcher.Resolver: superclass chains from the jar's bytes
++     */
++
++    private final HashMap infoCache = new HashMap();   /* internal name -> ClassInfo or NONE */
++    private final HashMap outerCache = new HashMap();  /* internal name -> Class or NONE */
++    private static final Object NONE = new Object();
++
++    public synchronized DiscClassPatcher.ClassInfo jarClass(String internalName) {
++        Object o = infoCache.get(internalName);
++        if (o == null) {
++            o = NONE;
++            String path = internalName + ".class";
++            URL u = findOwnResource(path);
++            if (u == null && outerClass(internalName) == null) {
++                /* not JDK / libbluray: a disc class of a parent loader
++                 * (DVBClassLoader), walked on from its bytes */
++                u = findOuterDiscResource(path);
++            }
++            if (u != null) {
++                DiscClassPatcher.ClassInfo info = readInfo(u);
++                if (info != null)
++                    o = info;
++            }
++            infoCache.put(internalName, o);
++        }
++        return o == NONE ? null : (DiscClassPatcher.ClassInfo)o;
++    }
++
++    public synchronized Class outerClass(String internalName) {
++        Object o = outerCache.get(internalName);
++        if (o == null) {
++            o = resolveOuter(internalName.replace('/', '.'));
++            if (o == null)
++                o = NONE;
++            outerCache.put(internalName, o);
++        }
++        return o == NONE ? null : (Class)o;
++    }
++
++    /* JDK and libbluray classes only: the system class loader never sees
++     * a disc class */
++    private static Class resolveOuter(final String name) {
++        return (Class)AccessController.doPrivileged(new PrivilegedAction() {
++                public Object run() {
++                    try {
++                        return Class.forName(name, false, ClassLoader.getSystemClassLoader());
++                    } catch (ClassNotFoundException e) {
++                        return null;
++                    } catch (LinkageError e) {
++                        return null;
++                    }
++                }
++            });
++    }
++
++    private DiscClassPatcher.ClassInfo readInfo(final URL u) {
++        byte[] b = (byte[])AccessController.doPrivileged(new PrivilegedAction() {
++                public Object run() {
++                    try {
++                        return readBytesPrivileged(u);
++                    } catch (IOException e) {
++                        return null;
++                    }
++                }
++            });
++        return b == null ? null : DiscClassPatcher.readClassInfo(b);
++    }
++
++    /*
++     * DISCDIAG TEMP: per loader counts, a line per jar at its first class,
++     * a summary at most once per 10 s, after the xlet class load and at
++     * xlet shutdown; every failure is logged with its class name.
++     */
++
++    private static final int D_CLASSES        = 0;
++    private static final int D_PATCHED        = 1;
++    private static final int D_TIMER_REMAPPED = 2;
++    private static final int D_STRIPPED       = 3;
++    private static final int D_DEBUG_DROPPED  = 4;
++    private static final int D_SIGNED         = 5;
++    private static final int D_COUNT          = 6;
++    private static final String[] D_NAMES = {
++        "classes", "patched", "timer_remapped", "stripped", "debug_dropped", "signed",
++    };
++
++    private final long[] counts = new long[D_COUNT];
++    private final long[] kinds = new long[DiscClassPatcher.K_COUNT];
++    private final StringBuffer failures = new StringBuffer();
++    private int failureCount = 0;
++    private final HashSet jarsSeen = new HashSet();
++    private boolean dirty = false;
++    private long lastReportNs = System.nanoTime();
++    private static final long REPORT_PERIOD_NS = 10000000000L;
++
++    private synchronized void count(int kind, int n) {
++        counts[kind] += n;
++        dirty = true;
++    }
++
++    private synchronized void fail(String name, String why) {
++        failureCount++;
++        if (failures.length() < 2000)
++            failures.append(' ').append(name).append('(').append(why).append(')');
++        dirty = true;
++    }
++
++    private void noteJar(Loaded l) {
++        String key = l.url.toExternalForm();
++        synchronized (this) {
++            if (!jarsSeen.add(key))
++                return;
++        }
++        logger.info("DISCDIAG TEMP disc time: " + loaderName + " loads from " + key +
++                    " signed=" + (l.cs.getCodeSigners() != null) +
++                    " manifest=" + (l.man != null) +
++                    " sealed=" + (l.man != null && "true".equalsIgnoreCase(
++                                      l.man.getMainAttributes().getValue(Attributes.Name.SEALED))));
++    }
++
++    private void maybeReport() {
++        report(null, false);
++    }
++
++    public void report(String why) {
++        report(why, true);
++    }
++
++    private void report(String why, boolean force) {
++        String msg;
++        synchronized (this) {
++            long now = System.nanoTime();
++            if (!dirty)
++                return;
++            if (!force && now - lastReportNs < REPORT_PERIOD_NS)
++                return;
++            lastReportNs = now;
++            dirty = false;
++            StringBuffer sb = new StringBuffer("DISCDIAG TEMP disc time patcher ");
++            sb.append(loaderName);
++            if (why != null)
++                sb.append(" (").append(why).append(")");
++            sb.append(':');
++            for (int i = 0; i < D_COUNT; i++)
++                sb.append(' ').append(D_NAMES[i]).append('=').append(counts[i]);
++            for (int i = 0; i < DiscClassPatcher.K_COUNT; i++)
++                sb.append(' ').append(DiscClassPatcher.K_NAMES[i]).append('=').append(kinds[i]);
++            sb.append(" failures=").append(failureCount);
++            if (failureCount > 0)
++                sb.append(" [").append(failures.toString().trim()).append(']');
++            msg = sb.toString();
++        }
++        logger.info(msg);
++    }
++
++    private final DiscClassPatcher patcher;
++    private final String loaderName;
++
++    private static final Logger logger = Logger.getLogger(DiscClassDefiner.class.getName());
++}
+diff --git a/src/libbluray/bdj/java/org/videolan/DiscClassPatcher.java b/src/libbluray/bdj/java/org/videolan/DiscClassPatcher.java
+new file mode 100644
+index 00000000..adead205
+--- /dev/null
++++ b/src/libbluray/bdj/java/org/videolan/DiscClassPatcher.java
+@@ -0,0 +1,463 @@
++/*
++ * This file is part of libbluray
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++package org.videolan;
++
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Map;
++
++import org.objectweb.asm.ClassReader;
++import org.objectweb.asm.ClassVisitor;
++import org.objectweb.asm.ClassWriter;
++import org.objectweb.asm.MethodVisitor;
++import org.objectweb.asm.Opcodes;
++import org.objectweb.asm.commons.RemappingClassAdapter;
++import org.objectweb.asm.commons.SimpleRemapper;
++
++/*
++ * Disc time (phase 5): the bytecode patcher for disc classes.
++ *
++ * Rewrites (ASM, ClassReader EXPAND_FRAMES, ClassWriter flags 0, debug
++ * info kept):
++ *  - invokestatic java/lang/System.currentTimeMillis()J / nanoTime()J
++ *    -> DiscTime;
++ *  - invokestatic sleep(J)V / (JI)V whose target resolves to
++ *    java/lang/Thread.sleep -> DiscTime.sleep;
++ *  - invokevirtual/special/interface wait(J)V / (JI)V whose target resolves
++ *    to java/lang/Object.wait -> DiscTime.waitOn (static; the receiver
++ *    becomes the first argument: same operand stack shape);
++ *  - invokevirtual/special/interface join(J)V / (JI)V whose target
++ *    resolves to java/lang/Thread.join -> DiscTime.joinOn;
++ *  - only for classes whose constant pool names java/util/Timer*:
++ *    RemappingClassAdapter java/util/Timer -> org/videolan/DiscTimer,
++ *    java/util/TimerTask -> org/videolan/DiscTimerTask (the remapper
++ *    renumbers locals, so it never runs on other classes).
++ *
++ * A target "resolves" to the JDK method when no disc class on the owner's
++ * superclass chain declares the same name and descriptor and the chain
++ * reaches java/lang/Thread (sleep, join) / any class (wait). The chain is
++ * read from the class bytes of the loader's own resources, never by
++ * loading; the first class outside them is resolved by the Resolver
++ * (JDK / libbluray classes only). Anything unresolved is left unchanged.
++ *
++ * The patcher holds no state: one instance per xlet context, the per
++ * loader state (class info cache, DISCDIAG counts) is in the Resolver /
++ * Stats the caller passes.
++ */
++public final class DiscClassPatcher {
++
++    /* null when disc time is off: no patcher, today's class loading */
++    public static DiscClassPatcher create() {
++        if (Libbluray.discTimeOff())
++            return null;
++        return new DiscClassPatcher();
++    }
++
++    DiscClassPatcher() {
++    }
++
++    /*
++     * what the patcher needs from the loader
++     */
++    public interface Resolver {
++        /* declared methods / super of a class in the loader's own jars,
++         * or null when the class is not there */
++        ClassInfo jarClass(String internalName);
++        /* a class outside the jars (JDK / libbluray), never a disc class;
++         * null when it cannot be resolved */
++        Class outerClass(String internalName);
++    }
++
++    public static final class ClassInfo {
++        final String superName;
++        final HashSet methods = new HashSet(); /* name + desc */
++
++        ClassInfo(String superName) {
++            this.superName = superName;
++        }
++
++        boolean declares(String name, String desc) {
++            return methods.contains(name + desc);
++        }
++    }
++
++    /* superclass and declared methods from class bytes; null if unparseable */
++    public static ClassInfo readClassInfo(byte[] b) {
++        try {
++            ClassReader cr = new ClassReader(b);
++            final ClassInfo[] info = new ClassInfo[1];
++            cr.accept(new ClassVisitor(Opcodes.ASM5) {
++                    public void visit(int version, int access, String name, String signature,
++                                      String superName, String[] interfaces) {
++                        info[0] = new ClassInfo(superName);
++                    }
++                    public MethodVisitor visitMethod(int access, String name, String desc,
++                                                     String signature, String[] exceptions) {
++                        info[0].methods.add(name + desc);
++                        return null;
++                    }
++                }, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
++            return info[0];
++        } catch (ThreadDeath td) {
++            throw td;
++        } catch (VirtualMachineError e) {
++            throw e;
++        } catch (Throwable t) {
++            return null;
++        }
++    }
++
++    /*
++     * DISCDIAG TEMP: counts by rewrite kind, per loader
++     */
++    public static final int K_MILLIS          = 0;
++    public static final int K_NANOS           = 1;
++    public static final int K_SLEEP           = 2;
++    public static final int K_WAIT            = 3;
++    public static final int K_JOIN            = 4;
++    public static final int K_KEPT_OVERRIDE   = 5;  /* a disc class declares the name+desc */
++    public static final int K_KEPT_UNRESOLVED = 6;  /* chain not resolvable */
++    public static final int K_REFLECT_TIMER   = 7;  /* "java.util.Timer*" string in the pool (ClassCastException risk) */
++    public static final int K_COUNT           = 8;
++
++    public static final String[] K_NAMES = {
++        "millis", "nanos", "sleep", "wait", "join",
++        "kept_override", "kept_unresolved", "reflect_timer_name",
++    };
++
++    /*
++     * result
++     */
++    public static final int R_UNCHANGED   = 0;  /* bytes are the input */
++    public static final int R_PATCHED     = 1;
++    public static final int R_UNPARSEABLE = 2;  /* bytes are the input; ERROR logged by the caller */
++    public static final int R_FAILED      = 3;  /* names the Timer types and cannot be remapped */
++
++    public static final class Result {
++        public final int kind;
++        public final byte[] bytes;
++        public final boolean timerRemapped;
++        public final boolean debugDropped;
++        public final int[] counts;
++        public final Throwable error;
++
++        Result(int kind, byte[] bytes, boolean timerRemapped, boolean debugDropped, int[] counts, Throwable error) {
++            this.kind = kind;
++            this.bytes = bytes;
++            this.timerRemapped = timerRemapped;
++            this.debugDropped = debugDropped;
++            this.counts = counts;
++            this.error = error;
++        }
++    }
++
++    public Result patch(String className, byte[] b, Resolver resolver) {
++        PoolScan scan = PoolScan.scan(b);
++        boolean namesTimer;
++        if (scan != null) {
++            namesTimer = scan.namesTimer;
++        } else {
++            namesTimer = rawContains(b, "java/util/Timer");
++        }
++
++        int[] counts = new int[K_COUNT];
++        if (scan != null && scan.reflectTimer)
++            counts[K_REFLECT_TIMER]++;
++
++        if (scan != null && !scan.timeNames && !namesTimer)
++            return new Result(R_UNCHANGED, b, false, false, counts, null);
++
++        byte[] out;
++        boolean debugDropped = false;
++        int[] c = new int[K_COUNT];
++        try {
++            out = rewrite(b, namesTimer, true, resolver, c);
++        } catch (ThreadDeath td) {
++            throw td;
++        } catch (VirtualMachineError e) {
++            throw e;
++        } catch (Throwable t1) {
++            /* broken debug info (see BDJClassFileTransformer.strip) */
++            c = new int[K_COUNT];
++            try {
++                out = rewrite(b, namesTimer, false, resolver, c);
++                debugDropped = true;
++            } catch (ThreadDeath td) {
++                throw td;
++            } catch (VirtualMachineError e) {
++                throw e;
++            } catch (Throwable t2) {
++                return new Result(namesTimer ? R_FAILED : R_UNPARSEABLE, b, false, false, counts, t2);
++            }
++        }
++
++        for (int i = 0; i < K_COUNT; i++)
++            counts[i] += c[i];
++
++        int rewrites = c[K_MILLIS] + c[K_NANOS] + c[K_SLEEP] + c[K_WAIT] + c[K_JOIN];
++        if (rewrites == 0 && !namesTimer)
++            return new Result(R_UNCHANGED, b, false, false, counts, null);
++
++        return new Result(R_PATCHED, out, namesTimer, debugDropped, counts, null);
++    }
++
++    private static final String DISC_TIME = "org/videolan/DiscTime";
++
++    private static final Map TIMER_MAP = new HashMap();
++    static {
++        TIMER_MAP.put("java/util/Timer", "org/videolan/DiscTimer");
++        TIMER_MAP.put("java/util/TimerTask", "org/videolan/DiscTimerTask");
++    }
++
++    private byte[] rewrite(byte[] b, boolean remapTimer, boolean keepDebug, Resolver resolver, int[] counts) {
++        ClassReader cr = new ClassReader(b);
++        ClassWriter cw = new ClassWriter(cr, 0);
++        ClassVisitor cv = cw;
++        if (remapTimer)
++            cv = new RemappingClassAdapter(cv, new SimpleRemapper(TIMER_MAP));
++        /* the call rewriter sees the original names, the remapper after it */
++        cv = new CallClassVisitor(cv, resolver, counts);
++        cr.accept(cv, ClassReader.EXPAND_FRAMES | (keepDebug ? 0 : ClassReader.SKIP_DEBUG));
++        return cw.toByteArray();
++    }
++
++    private static final class CallClassVisitor extends ClassVisitor {
++        private final Resolver resolver;
++        private final int[] counts;
++        private final HashMap cache = new HashMap(); /* owner+name+desc -> Integer */
++
++        CallClassVisitor(ClassVisitor cv, Resolver resolver, int[] counts) {
++            super(Opcodes.ASM5, cv);
++            this.resolver = resolver;
++            this.counts = counts;
++        }
++
++        public MethodVisitor visitMethod(int access, String name, String desc,
++                                         String signature, String[] exceptions) {
++            MethodVisitor mv = super.visitMethod(access, name, desc, signature, exceptions);
++            if (mv == null)
++                return null;
++            return new CallMethodVisitor(mv, this);
++        }
++
++        int resolve(String owner, String name, String desc, boolean needThread) {
++            String key = owner + "." + name + desc;
++            Integer r = (Integer)cache.get(key);
++            if (r == null) {
++                r = new Integer(resolveTarget(resolver, owner, name, desc, needThread));
++                cache.put(key, r);
++            }
++            return r.intValue();
++        }
++    }
++
++    private static final class CallMethodVisitor extends MethodVisitor {
++        private final CallClassVisitor cls;
++
++        CallMethodVisitor(MethodVisitor mv, CallClassVisitor cls) {
++            super(Opcodes.ASM5, mv);
++            this.cls = cls;
++        }
++
++        public void visitMethodInsn(int opcode, String owner, String name, String desc, boolean itf) {
++            int[] counts = cls.counts;
++
++            if (opcode == Opcodes.INVOKESTATIC) {
++                if (owner.equals("java/lang/System") && desc.equals("()J")) {
++                    if (name.equals("currentTimeMillis")) {
++                        counts[K_MILLIS]++;
++                        super.visitMethodInsn(Opcodes.INVOKESTATIC, DISC_TIME, "currentTimeMillis", "()J", false);
++                        return;
++                    }
++                    if (name.equals("nanoTime")) {
++                        counts[K_NANOS]++;
++                        super.visitMethodInsn(Opcodes.INVOKESTATIC, DISC_TIME, "nanoTime", "()J", false);
++                        return;
++                    }
++                }
++                if (name.equals("sleep") && (desc.equals("(J)V") || desc.equals("(JI)V"))) {
++                    int r = cls.resolve(owner, name, desc, true);
++                    if (r == T_JDK) {
++                        counts[K_SLEEP]++;
++                        super.visitMethodInsn(Opcodes.INVOKESTATIC, DISC_TIME, "sleep", desc, false);
++                        return;
++                    }
++                    count(counts, r);
++                }
++            } else if (opcode == Opcodes.INVOKEVIRTUAL || opcode == Opcodes.INVOKESPECIAL ||
++                       opcode == Opcodes.INVOKEINTERFACE) {
++                boolean j1 = desc.equals("(J)V");
++                if (j1 || desc.equals("(JI)V")) {
++                    if (name.equals("wait")) {
++                        int r = cls.resolve(owner, name, desc, false);
++                        if (r == T_JDK) {
++                            counts[K_WAIT]++;
++                            super.visitMethodInsn(Opcodes.INVOKESTATIC, DISC_TIME, "waitOn",
++                                                  j1 ? "(Ljava/lang/Object;J)V" : "(Ljava/lang/Object;JI)V", false);
++                            return;
++                        }
++                        count(counts, r);
++                    } else if (name.equals("join")) {
++                        int r = cls.resolve(owner, name, desc, true);
++                        if (r == T_JDK) {
++                            counts[K_JOIN]++;
++                            super.visitMethodInsn(Opcodes.INVOKESTATIC, DISC_TIME, "joinOn",
++                                                  j1 ? "(Ljava/lang/Thread;J)V" : "(Ljava/lang/Thread;JI)V", false);
++                            return;
++                        }
++                        count(counts, r);
++                    }
++                }
++            }
++
++            super.visitMethodInsn(opcode, owner, name, desc, itf);
++        }
++
++        private static void count(int[] counts, int r) {
++            if (r == T_OVERRIDE)
++                counts[K_KEPT_OVERRIDE]++;
++            else if (r == T_UNRESOLVED)
++                counts[K_KEPT_UNRESOLVED]++;
++        }
++    }
++
++    /*
++     * call target resolution
++     */
++    static final int T_JDK        = 0;  /* the JDK method: rewrite */
++    static final int T_OTHER      = 1;  /* not a Thread-chain owner */
++    static final int T_OVERRIDE   = 2;  /* a disc class declares name+desc */
++    static final int T_UNRESOLVED = 3;
++
++    private static final int MAX_DEPTH = 64;
++
++    static int resolveTarget(Resolver resolver, String owner, String name, String desc, boolean needThread) {
++        String c = owner;
++        for (int depth = 0; depth < MAX_DEPTH; depth++) {
++            if (c == null || c.equals("java/lang/Object") || c.startsWith("["))
++                return needThread ? T_OTHER : T_JDK;
++            if (c.equals("java/lang/Thread"))
++                return T_JDK;
++
++            ClassInfo info = resolver.jarClass(c);
++            if (info != null) {
++                if (info.declares(name, desc))
++                    return T_OVERRIDE;
++                c = info.superName;
++                continue;
++            }
++
++            Class k = resolver.outerClass(c);
++            if (k == null)
++                return T_UNRESOLVED;
++            if (!needThread)
++                return T_JDK;
++            return Thread.class.isAssignableFrom(k) ? T_JDK : T_OTHER;
++        }
++        return T_UNRESOLVED;
++    }
++
++    /*
++     * constant pool pre-scan
++     */
++    private static final class PoolScan {
++        boolean timeNames;     /* a name the call rewrites look for */
++        boolean namesTimer;    /* java/util/Timer or TimerTask anywhere (class, descriptor, signature) */
++        boolean reflectTimer;  /* "java.util.Timer" (dotted) */
++
++        static PoolScan scan(byte[] b) {
++            try {
++                PoolScan s = new PoolScan();
++                int count = u2(b, 8);
++                int p = 10;
++                for (int i = 1; i < count; i++) {
++                    int tag = b[p] & 0xff;
++                    switch (tag) {
++                    case 1: { /* Utf8 */
++                        int len = u2(b, p + 1);
++                        s.check(b, p + 3, len);
++                        p += 3 + len;
++                        break;
++                    }
++                    case 3: case 4: case 9: case 10: case 11: case 12: case 18:
++                        p += 5;
++                        break;
++                    case 5: case 6:
++                        p += 9;
++                        i++;
++                        break;
++                    case 7: case 8: case 16:
++                        p += 3;
++                        break;
++                    case 15:
++                        p += 4;
++                        break;
++                    default:
++                        return null;
++                    }
++                    if (p > b.length)
++                        return null;
++                }
++                return s;
++            } catch (ArrayIndexOutOfBoundsException e) {
++                return null;
++            }
++        }
++
++        private static int u2(byte[] b, int p) {
++            return ((b[p] & 0xff) << 8) | (b[p + 1] & 0xff);
++        }
++
++        private void check(byte[] b, int p, int len) {
++            if (equalsAscii(b, p, len, "currentTimeMillis") || equalsAscii(b, p, len, "nanoTime") ||
++                equalsAscii(b, p, len, "sleep") || equalsAscii(b, p, len, "wait") ||
++                equalsAscii(b, p, len, "join"))
++                timeNames = true;
++            if (indexOf(b, p, len, "java/util/Timer") >= 0)
++                namesTimer = true;
++            if (indexOf(b, p, len, "java.util.Timer") >= 0)
++                reflectTimer = true;
++        }
++    }
++
++    private static boolean equalsAscii(byte[] b, int p, int len, String s) {
++        if (len != s.length())
++            return false;
++        for (int i = 0; i < len; i++)
++            if (b[p + i] != (byte)s.charAt(i))
++                return false;
++        return true;
++    }
++
++    private static int indexOf(byte[] b, int p, int len, String s) {
++        int n = s.length();
++        for (int i = 0; i + n <= len; i++) {
++            int j = 0;
++            while (j < n && b[p + i + j] == (byte)s.charAt(j))
++                j++;
++            if (j == n)
++                return i;
++        }
++        return -1;
++    }
++
++    static boolean rawContains(byte[] b, String s) {
++        return indexOf(b, 0, b.length, s) >= 0;
++    }
++}
+diff --git a/src/libbluray/bdj/java/org/videolan/DiscTime.java b/src/libbluray/bdj/java/org/videolan/DiscTime.java
+new file mode 100644
+index 00000000..e1794504
+--- /dev/null
++++ b/src/libbluray/bdj/java/org/videolan/DiscTime.java
+@@ -0,0 +1,389 @@
++/*
++ * This file is part of libbluray
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++package org.videolan;
++
++/*
++ * Disc time (phase 5): the time a disc reads.
++ *
++ * Disc time runs at 1x, except while the player freezes it for an output
++ * change (a mode set, a held start); it never goes back. The clock lives in
++ * libbluray C (Libbluray.discTime*), process-wide.
++ *
++ * The helpers below replace the JDK time sources a disc uses. They keep the
++ * JDK 8u462 argument checks and exceptions: IllegalArgumentException before
++ * any monitor is touched, IllegalMonitorStateException and
++ * InterruptedException from the JDK wait/sleep itself (interrupt status
++ * cleared when thrown), wait(0,0) / join(0) / sleep(0) passed through.
++ *
++ * Waits run on wall time towards the disc deadline: while disc time runs
++ * one wall wait covers the remaining disc time; a wall wait that ends with
++ * disc time short (frozen) waits again, in slices of min(remaining, 50) ms
++ * only while frozen. A remainder that rounds to 0 ms waits 1 ms (never a
++ * wait(0)); deadlines saturate at Long.MAX_VALUE.
++ *
++ * waitOn: an early wake (notify, interrupt-free spurious wake) returns at
++ * once, as Object.wait does. A notify that coincides with the wall timeout
++ * during a freeze is indistinguishable from the timeout (inherent to
++ * wait(J)); the helper waits again and that notify is lost until the disc
++ * deadline. Counted in DISCDIAG.
++ *
++ * Off (bluray.disctime.off, set by libbluray before Libbluray.init): every
++ * helper is the JDK call it replaces.
++ */
++public final class DiscTime {
++
++    private DiscTime() {
++    }
++
++    /* off flag: read at class init and again at every Libbluray.init (the
++     * JVM is shared by later discs) */
++    private static volatile boolean off = Libbluray.discTimeOff();
++
++    static void init() {
++        diagReport("before disc start", true);
++        synchronized (diagLock) {
++            for (int i = 0; i < D_COUNT; i++)
++                diagCounts[i] = 0;
++            diagDirty = false;
++        }
++        off = Libbluray.discTimeOff();
++    }
++
++    public static boolean isOff() {
++        return off;
++    }
++
++    /* slice length while frozen (ms) */
++    private static final long FROZEN_SLICE_MS = 50;
++    /* disc time that fell behind wall time by more than this over one wall
++     * wait was frozen during it */
++    private static final long FROZEN_TOLERANCE_NS = 1000000L;
++
++    /*
++     * time sources
++     */
++
++    /* no synchronized: the native's pthread mutex is a full barrier, which
++     * is what the Evangelion fix (System.currentTimeMillisSynced) needed */
++    public static long currentTimeMillis() {
++        if (off)
++            return System.currentTimeMillis();
++        return Libbluray.discTimeMillis();
++    }
++
++    public static long nanoTime() {
++        if (off)
++            return System.nanoTime();
++        return Libbluray.discTimeNanos();
++    }
++
++    /*
++     * Thread.sleep
++     */
++
++    public static void sleep(long millis) throws InterruptedException {
++        if (millis < 0) {
++            throw new IllegalArgumentException("timeout value is negative");
++        }
++        if (off || millis == 0) {
++            Thread.sleep(millis);
++            return;
++        }
++
++        diagCount(D_SLEEP_CALLS);
++
++        long deadline = deadlineNs(Libbluray.discTimeNanos(), millis);
++        long waitMs = millis;
++        boolean extended = false;
++
++        while (true) {
++            long wall0 = System.nanoTime();
++            long disc0 = Libbluray.discTimeNanos();
++            Thread.sleep(waitMs);
++            long disc1 = Libbluray.discTimeNanos();
++            long wall1 = System.nanoTime();
++
++            long remaining = deadline - disc1;
++            if (remaining <= 0) {
++                break;
++            }
++            /* disc time short: frozen during this sleep, or it ran short of
++             * the wall wait (frozen until a future run instant) */
++            if (!extended) {
++                extended = true;
++                diagCount(D_SLEEP_FROZEN_WAITS);
++            }
++            diagCount(D_SLEEP_FROZEN_SLICES);
++            waitMs = nextWaitMs(remaining, frozenDuring(wall0, wall1, disc0, disc1));
++        }
++
++        diagMaybeReport();
++    }
++
++    /* JDK 8u462 Thread.sleep(JI) prologue */
++    public static void sleep(long millis, int nanos) throws InterruptedException {
++        if (millis < 0) {
++            throw new IllegalArgumentException("timeout value is negative");
++        }
++        if (nanos < 0 || nanos > 999999) {
++            throw new IllegalArgumentException("nanosecond timeout value out of range");
++        }
++        if (nanos >= 500000 || (nanos != 0 && millis == 0)) {
++            millis++;
++        }
++        sleep(millis);
++    }
++
++    /*
++     * Object.wait
++     */
++
++    public static void waitOn(Object obj, long timeout) throws InterruptedException {
++        if (obj == null) {
++            /* invokevirtual on null: NullPointerException before anything */
++            throw new NullPointerException();
++        }
++        if (timeout < 0) {
++            throw new IllegalArgumentException("timeout value is negative");
++        }
++        if (off || timeout == 0) {
++            obj.wait(timeout);
++            return;
++        }
++
++        /* the first monitor-sensitive operation is obj.wait itself, so
++         * IllegalMonitorStateException comes from the JDK as before */
++        long deadline = deadlineNs(Libbluray.discTimeNanos(), timeout);
++        long waitMs = timeout;
++        boolean rewaited = false;
++
++        while (true) {
++            long wall0 = System.nanoTime();
++            long disc0 = Libbluray.discTimeNanos();
++            obj.wait(waitMs);
++            long disc1 = Libbluray.discTimeNanos();
++            long wall1 = System.nanoTime();
++
++            if (wall1 - wall0 < msToNs(waitMs)) {
++                /* woken before the wall timeout: notify or spurious wake */
++                diagCount(D_WAIT_EARLY);
++                break;
++            }
++            long remaining = deadline - disc1;
++            if (remaining <= 0) {
++                diagCount(rewaited ? D_WAIT_TIMEOUT_AFTER_FREEZE : D_WAIT_TIMEOUT);
++                break;
++            }
++            /* wall timeout with disc time short: frozen, wait again */
++            rewaited = true;
++            diagCount(D_WAIT_REWAITS);
++            waitMs = nextWaitMs(remaining, frozenDuring(wall0, wall1, disc0, disc1));
++        }
++
++        diagMaybeReport();
++    }
++
++    /* JDK 8u462 Object.wait(JI) prologue */
++    public static void waitOn(Object obj, long timeout, int nanos) throws InterruptedException {
++        if (obj == null) {
++            throw new NullPointerException();
++        }
++        if (timeout < 0) {
++            throw new IllegalArgumentException("timeout value is negative");
++        }
++        if (nanos < 0 || nanos > 999999) {
++            throw new IllegalArgumentException("nanosecond timeout value out of range");
++        }
++        if (nanos > 0) {
++            timeout++;
++        }
++        waitOn(obj, timeout);
++    }
++
++    /*
++     * Thread.join
++     */
++
++    public static void joinOn(Thread thread, long millis) throws InterruptedException {
++        if (thread == null) {
++            throw new NullPointerException();
++        }
++        if (millis < 0) {
++            throw new IllegalArgumentException("timeout value is negative");
++        }
++        if (off || millis == 0) {
++            thread.join(millis);
++            return;
++        }
++
++        diagCount(D_JOIN_CALLS);
++
++        /* as Thread.join(J): wait on the thread, which notifies all at its
++         * exit; loop until it is dead or the disc deadline passed */
++        synchronized (thread) {
++            long deadline = deadlineNs(Libbluray.discTimeNanos(), millis);
++            boolean frozen = false;
++            boolean extended = false;
++            while (thread.isAlive()) {
++                long disc0 = Libbluray.discTimeNanos();
++                long remaining = deadline - disc0;
++                if (remaining <= 0) {
++                    break;
++                }
++                long waitMs = nextWaitMs(remaining, frozen);
++                long wall0 = System.nanoTime();
++                thread.wait(waitMs);
++                long disc1 = Libbluray.discTimeNanos();
++                long wall1 = System.nanoTime();
++                frozen = frozenDuring(wall0, wall1, disc0, disc1);
++                if (frozen && !extended) {
++                    extended = true;
++                    diagCount(D_JOIN_FROZEN_WAITS);
++                }
++            }
++        }
++
++        diagMaybeReport();
++    }
++
++    /* JDK 8u462 Thread.join(JI) prologue */
++    public static void joinOn(Thread thread, long millis, int nanos) throws InterruptedException {
++        if (thread == null) {
++            throw new NullPointerException();
++        }
++        if (millis < 0) {
++            throw new IllegalArgumentException("timeout value is negative");
++        }
++        if (nanos < 0 || nanos > 999999) {
++            throw new IllegalArgumentException("nanosecond timeout value out of range");
++        }
++        if (nanos >= 500000 || (nanos != 0 && millis == 0)) {
++            millis++;
++        }
++        joinOn(thread, millis);
++    }
++
++    /*
++     * arithmetic (saturating)
++     */
++
++    static long msToNs(long ms) {
++        if (ms >= Long.MAX_VALUE / 1000000L)
++            return Long.MAX_VALUE;
++        return ms * 1000000L;
++    }
++
++    static long deadlineNs(long nowNs, long ms) {
++        long ns = msToNs(ms);
++        if (nowNs > 0 && ns > Long.MAX_VALUE - nowNs)
++            return Long.MAX_VALUE;
++        return nowNs + ns;
++    }
++
++    /* remaining ns (> 0) to a wall wait in ms: rounded up, so never 0 */
++    static long ceilMs(long ns) {
++        long ms = ns / 1000000L;
++        if (ns % 1000000L != 0)
++            ms++;
++        return ms < 1 ? 1 : ms;
++    }
++
++    static long nextWaitMs(long remainingNs, boolean frozen) {
++        long ms = ceilMs(remainingNs);
++        if (frozen && ms > FROZEN_SLICE_MS)
++            ms = FROZEN_SLICE_MS;
++        return ms;
++    }
++
++    /* disc time advanced less than wall time over [wall0, wall1] */
++    static boolean frozenDuring(long wall0, long wall1, long disc0, long disc1) {
++        return (wall1 - wall0) - (disc1 - disc0) > FROZEN_TOLERANCE_NS;
++    }
++
++    /*
++     * DISCDIAG TEMP: counters per kind, logged at most once per 10 s and at
++     * xlet shutdown. Never counted on the time-source hot paths.
++     */
++
++    static final int D_SLEEP_CALLS               = 0;
++    static final int D_SLEEP_FROZEN_WAITS        = 1;  /* sleeps that waited past their wall time */
++    static final int D_SLEEP_FROZEN_SLICES       = 2;  /* extra wall sleeps for those */
++    static final int D_WAIT_EARLY                = 3;  /* waitOn returned on notify / spurious wake */
++    static final int D_WAIT_TIMEOUT              = 4;  /* waitOn timed out with disc time running */
++    static final int D_WAIT_REWAITS              = 5;  /* waitOn wall timeouts that found disc time short */
++    static final int D_WAIT_TIMEOUT_AFTER_FREEZE = 6;  /* waitOn timeouts reached only after a re-wait */
++    static final int D_JOIN_CALLS                = 7;
++    static final int D_JOIN_FROZEN_WAITS         = 8;
++    static final int D_TIMER_FIRINGS             = 9;  /* DiscTimer task runs */
++    static final int D_TIMER_FROZEN_RECHECKS     = 10; /* DiscTimer queue waits that found disc time frozen */
++    private static final int D_COUNT             = 11;
++
++    private static final String[] D_NAMES = {
++        "sleep", "sleep_frozen", "sleep_slices",
++        "wait_early", "wait_timeout", "wait_rewait", "wait_timeout_after_freeze",
++        "join", "join_frozen",
++        "timer_fired", "timer_frozen_recheck",
++    };
++
++    private static final Object diagLock = new Object();
++    private static final long[] diagCounts = new long[D_COUNT];
++    private static long diagLastNs = System.nanoTime();
++    private static boolean diagDirty = false;
++    private static final long DIAG_PERIOD_NS = 10000000000L;
++
++    static void diagCount(int kind) {
++        synchronized (diagLock) {
++            diagCounts[kind]++;
++            diagDirty = true;
++        }
++    }
++
++    /* call with no lock of ours held */
++    static void diagMaybeReport() {
++        diagReport(null, false);
++    }
++
++    /* xlet shutdown / disc start: report now if anything changed */
++    public static void diagReport(String why) {
++        diagReport(why, true);
++    }
++
++    private static void diagReport(String why, boolean force) {
++        String msg;
++        synchronized (diagLock) {
++            long now = System.nanoTime();
++            if (!diagDirty)
++                return;
++            if (!force && now - diagLastNs < DIAG_PERIOD_NS)
++                return;
++            diagLastNs = now;
++            diagDirty = false;
++            StringBuffer sb = new StringBuffer("DISCDIAG TEMP disc time");
++            if (why != null)
++                sb.append(" (").append(why).append(")");
++            sb.append(off ? " off:" : ":");
++            for (int i = 0; i < D_COUNT; i++)
++                sb.append(' ').append(D_NAMES[i]).append('=').append(diagCounts[i]);
++            msg = sb.toString();
++        }
++        logger.info(msg);
++    }
++
++    private static final Logger logger = Logger.getLogger(DiscTime.class.getName());
++}
+diff --git a/src/libbluray/bdj/java/org/videolan/DiscTimer.java b/src/libbluray/bdj/java/org/videolan/DiscTimer.java
+new file mode 100644
+index 00000000..64eb5930
+--- /dev/null
++++ b/src/libbluray/bdj/java/org/videolan/DiscTimer.java
+@@ -0,0 +1,377 @@
++/*
++ * This file is part of libbluray
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++package org.videolan;
++
++import java.util.Date;
++
++/*
++ * java.util.Timer (OpenJDK 8 semantics) scheduled on disc time: delays and
++ * Date instants are disc milliseconds (DiscTime.currentTimeMillis), so a
++ * task does not run while disc time is frozen. Disc classes that use
++ * java.util.Timer are remapped onto this class, so it is not final.
++ *
++ * The timer thread is created in the caller's thread group (an xlet's
++ * timer belongs to that xlet: getCurrentContext() works in its tasks and
++ * xlet shutdown stops it).
++ *
++ * The queue loop waits on its own queue (not via DiscTime.waitOn), with a
++ * wall timeout equal to the disc time left; a wait that ends with disc time
++ * short re-checks, in slices of at most 50 ms only while frozen.
++ *
++ * Off (DiscTime.isOff() at construction): the clock is
++ * System.currentTimeMillis, as java.util.Timer.
++ */
++public class DiscTimer {
++
++    private final TaskQueue queue = new TaskQueue();
++
++    private final TimerThread thread;
++
++    private final boolean wallClock;
++
++    /* stops the thread when the timer is garbage and its queue is empty */
++    private final Object threadReaper = new Object() {
++        protected void finalize() throws Throwable {
++            synchronized (queue) {
++                thread.newTasksMayBeScheduled = false;
++                queue.notify();
++            }
++        }
++    };
++
++    private static int nextSerialNumber = 0;
++
++    private static synchronized int serialNumber() {
++        return nextSerialNumber++;
++    }
++
++    public DiscTimer() {
++        this("Timer-" + serialNumber());
++    }
++
++    public DiscTimer(boolean isDaemon) {
++        this("Timer-" + serialNumber(), isDaemon);
++    }
++
++    /* as java.util.Timer(String): the thread keeps the daemon status it
++     * inherits from its creator */
++    public DiscTimer(String name) {
++        this(name, null);
++    }
++
++    public DiscTimer(String name, boolean isDaemon) {
++        this(name, isDaemon ? Boolean.TRUE : Boolean.FALSE);
++    }
++
++    private DiscTimer(String name, Boolean isDaemon) {
++        if (name == null) {
++            /* as Thread.setName(null) in java.util.Timer */
++            throw new NullPointerException("name cannot be null");
++        }
++        wallClock = DiscTime.isOff();
++        thread = new TimerThread(Thread.currentThread().getThreadGroup(), name, queue, wallClock);
++        if (isDaemon != null)
++            thread.setDaemon(isDaemon.booleanValue());
++        thread.start();
++    }
++
++    /* the timer's clock (ms) */
++    long now() {
++        return wallClock ? System.currentTimeMillis() : DiscTime.currentTimeMillis();
++    }
++
++    public void schedule(DiscTimerTask task, long delay) {
++        if (delay < 0)
++            throw new IllegalArgumentException("Negative delay.");
++        sched(task, now() + delay, 0);
++    }
++
++    public void schedule(DiscTimerTask task, Date time) {
++        sched(task, time.getTime(), 0);
++    }
++
++    public void schedule(DiscTimerTask task, long delay, long period) {
++        if (delay < 0)
++            throw new IllegalArgumentException("Negative delay.");
++        if (period <= 0)
++            throw new IllegalArgumentException("Non-positive period.");
++        sched(task, now() + delay, -period);
++    }
++
++    public void schedule(DiscTimerTask task, Date firstTime, long period) {
++        if (period <= 0)
++            throw new IllegalArgumentException("Non-positive period.");
++        sched(task, firstTime.getTime(), -period);
++    }
++
++    public void scheduleAtFixedRate(DiscTimerTask task, long delay, long period) {
++        if (delay < 0)
++            throw new IllegalArgumentException("Negative delay.");
++        if (period <= 0)
++            throw new IllegalArgumentException("Non-positive period.");
++        sched(task, now() + delay, period);
++    }
++
++    public void scheduleAtFixedRate(DiscTimerTask task, Date firstTime, long period) {
++        if (period <= 0)
++            throw new IllegalArgumentException("Non-positive period.");
++        sched(task, firstTime.getTime(), period);
++    }
++
++    private void sched(DiscTimerTask task, long time, long period) {
++        if (time < 0)
++            throw new IllegalArgumentException("Illegal execution time.");
++
++        /* constrain the period to prevent numeric overflow */
++        if (Math.abs(period) > (Long.MAX_VALUE >> 1))
++            period >>= 1;
++
++        synchronized (queue) {
++            if (!thread.newTasksMayBeScheduled)
++                throw new IllegalStateException("Timer already cancelled.");
++
++            synchronized (task.lock) {
++                if (task.state != DiscTimerTask.VIRGIN)
++                    throw new IllegalStateException(
++                        "Task already scheduled or cancelled");
++                task.nextExecutionTime = time;
++                task.period = period;
++                task.state = DiscTimerTask.SCHEDULED;
++            }
++
++            queue.add(task);
++            if (queue.getMin() == task)
++                queue.notify();
++        }
++    }
++
++    public void cancel() {
++        synchronized (queue) {
++            thread.newTasksMayBeScheduled = false;
++            queue.clear();
++            queue.notify();
++        }
++    }
++
++    public int purge() {
++        int result = 0;
++
++        synchronized (queue) {
++            for (int i = queue.size(); i > 0; i--) {
++                if (queue.get(i).state == DiscTimerTask.CANCELLED) {
++                    queue.quickRemove(i);
++                    result++;
++                }
++            }
++
++            if (result != 0)
++                queue.heapify();
++        }
++
++        return result;
++    }
++
++    /*
++     * java.util.TimerThread on disc time
++     */
++
++    private static final class TimerThread extends Thread {
++
++        boolean newTasksMayBeScheduled = true;
++
++        private final TaskQueue queue;
++        private final boolean wallClock;
++
++        TimerThread(ThreadGroup group, String name, TaskQueue queue, boolean wallClock) {
++            super(group, name);
++            this.queue = queue;
++            this.wallClock = wallClock;
++        }
++
++        public void run() {
++            try {
++                mainLoop();
++            } finally {
++                synchronized (queue) {
++                    newTasksMayBeScheduled = false;
++                    queue.clear();
++                }
++            }
++        }
++
++        private long now() {
++            return wallClock ? System.currentTimeMillis() : DiscTime.currentTimeMillis();
++        }
++
++        private void mainLoop() {
++            /* disc time was frozen over the last timed wait */
++            boolean frozen = false;
++
++            while (true) {
++                try {
++                    DiscTimerTask task;
++                    boolean taskFired;
++                    synchronized (queue) {
++                        while (queue.isEmpty() && newTasksMayBeScheduled)
++                            queue.wait();
++                        if (queue.isEmpty())
++                            break;
++
++                        long currentTime, executionTime;
++                        task = queue.getMin();
++                        synchronized (task.lock) {
++                            if (task.state == DiscTimerTask.CANCELLED) {
++                                queue.removeMin();
++                                continue;
++                            }
++                            currentTime = now();
++                            executionTime = task.nextExecutionTime;
++                            if (taskFired = (executionTime <= currentTime)) {
++                                if (task.period == 0) {
++                                    queue.removeMin();
++                                    task.state = DiscTimerTask.EXECUTED;
++                                } else {
++                                    queue.rescheduleMin(
++                                        task.period < 0 ? currentTime   - task.period
++                                                        : executionTime + task.period);
++                                }
++                            }
++                        }
++                        if (!taskFired) {
++                            long waitMs = executionTime - currentTime;
++                            if (wallClock) {
++                                queue.wait(waitMs);
++                            } else {
++                                if (frozen && waitMs > 50)
++                                    waitMs = 50;
++                                long wall0 = System.nanoTime();
++                                long disc0 = Libbluray.discTimeNanos();
++                                queue.wait(waitMs);
++                                long disc1 = Libbluray.discTimeNanos();
++                                long wall1 = System.nanoTime();
++                                frozen = DiscTime.frozenDuring(wall0, wall1, disc0, disc1);
++                                if (frozen)
++                                    DiscTime.diagCount(DiscTime.D_TIMER_FROZEN_RECHECKS);
++                            }
++                        }
++                    }
++                    if (taskFired) {
++                        if (!wallClock) {
++                            DiscTime.diagCount(DiscTime.D_TIMER_FIRINGS);
++                            DiscTime.diagMaybeReport();
++                        }
++                        task.run();
++                    }
++                } catch (InterruptedException e) {
++                }
++            }
++        }
++    }
++
++    /*
++     * java.util.TaskQueue: a priority queue of tasks ordered on
++     * nextExecutionTime (balanced binary heap, queue[1] is the min)
++     */
++
++    private static final class TaskQueue {
++
++        private DiscTimerTask[] queue = new DiscTimerTask[128];
++
++        private int size = 0;
++
++        int size() {
++            return size;
++        }
++
++        void add(DiscTimerTask task) {
++            if (size + 1 == queue.length) {
++                DiscTimerTask[] grown = new DiscTimerTask[2 * queue.length];
++                System.arraycopy(queue, 0, grown, 0, queue.length);
++                queue = grown;
++            }
++
++            queue[++size] = task;
++            fixUp(size);
++        }
++
++        DiscTimerTask getMin() {
++            return queue[1];
++        }
++
++        DiscTimerTask get(int i) {
++            return queue[i];
++        }
++
++        void removeMin() {
++            queue[1] = queue[size];
++            queue[size--] = null;
++            fixDown(1);
++        }
++
++        void quickRemove(int i) {
++            /* assert i <= size; */
++            queue[i] = queue[size];
++            queue[size--] = null;
++        }
++
++        void rescheduleMin(long newTime) {
++            queue[1].nextExecutionTime = newTime;
++            fixDown(1);
++        }
++
++        boolean isEmpty() {
++            return size == 0;
++        }
++
++        void clear() {
++            for (int i = 1; i <= size; i++)
++                queue[i] = null;
++
++            size = 0;
++        }
++
++        private void fixUp(int k) {
++            while (k > 1) {
++                int j = k >> 1;
++                if (queue[j].nextExecutionTime <= queue[k].nextExecutionTime)
++                    break;
++                DiscTimerTask tmp = queue[j];  queue[j] = queue[k]; queue[k] = tmp;
++                k = j;
++            }
++        }
++
++        private void fixDown(int k) {
++            int j;
++            while ((j = k << 1) <= size && j > 0) {
++                if (j < size &&
++                    queue[j].nextExecutionTime > queue[j + 1].nextExecutionTime)
++                    j++;
++                if (queue[k].nextExecutionTime <= queue[j].nextExecutionTime)
++                    break;
++                DiscTimerTask tmp = queue[j];  queue[j] = queue[k]; queue[k] = tmp;
++                k = j;
++            }
++        }
++
++        void heapify() {
++            for (int i = size / 2; i >= 1; i--)
++                fixDown(i);
++        }
++    }
++}
+diff --git a/src/libbluray/bdj/java/org/videolan/DiscTimerTask.java b/src/libbluray/bdj/java/org/videolan/DiscTimerTask.java
+new file mode 100644
+index 00000000..1293518a
+--- /dev/null
++++ b/src/libbluray/bdj/java/org/videolan/DiscTimerTask.java
+@@ -0,0 +1,62 @@
++/*
++ * This file is part of libbluray
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++package org.videolan;
++
++/*
++ * java.util.TimerTask (OpenJDK 8 semantics) for DiscTimer: times are disc
++ * milliseconds (DiscTime.currentTimeMillis). Disc classes that extend
++ * java.util.TimerTask are remapped onto this class.
++ */
++public abstract class DiscTimerTask implements Runnable {
++
++    final Object lock = new Object();
++
++    int state = VIRGIN;
++
++    static final int VIRGIN = 0;
++    static final int SCHEDULED = 1;
++    static final int EXECUTED = 2;
++    static final int CANCELLED = 3;
++
++    /* disc ms; for a repeating task updated before each execution */
++    long nextExecutionTime;
++
++    /* > 0 fixed rate, < 0 fixed delay, 0 one-shot */
++    long period = 0;
++
++    protected DiscTimerTask() {
++    }
++
++    public abstract void run();
++
++    public boolean cancel() {
++        synchronized (lock) {
++            boolean result = (state == SCHEDULED);
++            state = CANCELLED;
++            return result;
++        }
++    }
++
++    public long scheduledExecutionTime() {
++        synchronized (lock) {
++            return (period < 0 ? nextExecutionTime + period
++                               : nextExecutionTime - period);
++        }
++    }
++}
+diff --git a/src/libbluray/bdj/java/org/videolan/Libbluray.java b/src/libbluray/bdj/java/org/videolan/Libbluray.java
+index 8cc212cc..0a058942 100644
+--- a/src/libbluray/bdj/java/org/videolan/Libbluray.java
++++ b/src/libbluray/bdj/java/org/videolan/Libbluray.java
+@@ -235,6 +235,10 @@ public class Libbluray {
+ 
+         initOnce();
+ 
++        /* disc time: re-read the off flag (set by libbluray before this
++         * call on every BD-J start); DISCDIAG counters restart per disc */
++        DiscTime.init();
++
+         /* set up directories */
+ 
+         try {
+@@ -651,6 +655,30 @@ public class Libbluray {
+         return presentationInfoN(nativePointer, which);
+     }
+ 
++    /* disc time (phase 5): the process-lifetime disc clock in libbluray.
++     * Disc ns run at 1x except while the player freezes them for an output
++     * change; they never go back. No native pointer: callable from any
++     * thread, before init and after shutdown. */
++    public static long discTimeNanos() {
++        return discTimeNanosN();
++    }
++
++    /* disc ns at a CLOCK_MONOTONIC instant (e.g. a presentation start) */
++    public static long discTimeAt(long monoNs) {
++        return discTimeAtN(monoNs);
++    }
++
++    /* wall time (ms) at the disc's start + disc ms since then */
++    public static long discTimeMillis() {
++        return discTimeMillisN();
++    }
++
++    /* disctime_off: set by libbluray before Libbluray.init on every BD-J
++     * start (BLURAY_PLAYER_SETTING_DISC_TIME_OFF); off = today's wall time */
++    public static boolean discTimeOff() {
++        return "true".equals(System.getProperty("bluray.disctime.off"));
++    }
++
+     public static boolean selectRate(float rate) {
+         return selectRateN(nativePointer, rate, 0) == 1 ? true : false;
+     }
+@@ -915,6 +943,9 @@ public class Libbluray {
+     private static native void setKeyInterestN(long np, int mask);
+     private static native long tellTimeN(long np);
+     private static native long presentationInfoN(long np, int which);
++    private static native long discTimeNanosN();
++    private static native long discTimeAtN(long monoNs);
++    private static native long discTimeMillisN();
+     private static native int selectRateN(long np, float rate, int reason);
+     private static native int writeRegN(long np, int is_psr, int num, int value, int psr_value_mask);
+     private static native int readRegN(long np, int is_psr, int num);
+diff --git a/src/libbluray/bdj/java/org/videolan/media/content/BDHandler.java b/src/libbluray/bdj/java/org/videolan/media/content/BDHandler.java
+index ac591e20..d7201350 100644
+--- a/src/libbluray/bdj/java/org/videolan/media/content/BDHandler.java
++++ b/src/libbluray/bdj/java/org/videolan/media/content/BDHandler.java
+@@ -68,6 +68,7 @@ import org.videolan.BDJActionManager;
+ import org.videolan.BDJActionQueue;
+ import org.videolan.BDJListeners;
+ import org.videolan.BDJXletContext;
++import org.videolan.DiscTime;
+ import org.videolan.Libbluray;
+ import org.videolan.Logger;
+ 
+@@ -403,8 +404,15 @@ public abstract class BDHandler implements Player, ServiceContentHandler {
+             if (presented && Libbluray.presentationInfo(2) == pendingGen)
+                 startNs = Libbluray.presentationInfo(3);
+             baseTime = getTimeBase().getNanoseconds();
+-            if (startNs != 0)
+-                baseTime -= System.nanoTime() - startNs;
++            if (startNs != 0) {
++                /* the media clock starts at the presentation instant: in disc
++                 * time (phase 5) that instant is converted by the disc clock,
++                 * so a freeze between it and now is not counted */
++                if (DiscTime.isOff())
++                    baseTime -= System.nanoTime() - startNs;
++                else
++                    baseTime -= Libbluray.discTimeNanos() - Libbluray.discTimeAt(startNs);
++            }
+             startPending = false;
+             waited = System.currentTimeMillis() - pendingSince;
+         }
+diff --git a/src/libbluray/bdj/native/org_videolan_Libbluray.c b/src/libbluray/bdj/native/org_videolan_Libbluray.c
+index 71fa94f0..0521786f 100644
+--- a/src/libbluray/bdj/native/org_videolan_Libbluray.c
++++ b/src/libbluray/bdj/native/org_videolan_Libbluray.c
+@@ -35,6 +35,7 @@
+ #include "file/file.h"
+ #include "util/logging.h"
+ #include "util/macro.h"
++#include "util/time.h"
+ 
+ #include <stdlib.h>
+ #include <string.h>
+@@ -344,6 +345,24 @@ JNIEXPORT jlong JNICALL Java_org_videolan_Libbluray_presentationInfoN(JNIEnv * e
+     return bdpriv_bdj_presentation_info(bd, which);
+ }
+ 
++/* disc time (phase 5): the process-lifetime disc clock. No BLURAY
++ * pointer and no bd->mutex: the clock outlives the disc and its lock is
++ * a leaf, so any xlet thread may call these at any time. */
++JNIEXPORT jlong JNICALL Java_org_videolan_Libbluray_discTimeNanosN(JNIEnv * env,
++        jclass cls) {
++    return (jlong)disc_time_ns();
++}
++
++JNIEXPORT jlong JNICALL Java_org_videolan_Libbluray_discTimeAtN(JNIEnv * env,
++        jclass cls, jlong monoNs) {
++    return (jlong)disc_time_at((int64_t)monoNs);
++}
++
++JNIEXPORT jlong JNICALL Java_org_videolan_Libbluray_discTimeMillisN(JNIEnv * env,
++        jclass cls) {
++    return (jlong)disc_time_millis();
++}
++
+ JNIEXPORT jint JNICALL Java_org_videolan_Libbluray_selectRateN(JNIEnv * env,
+         jclass cls, jlong np, jfloat rate, jint reason) {
+     BLURAY* bd = (BLURAY*)(intptr_t)np;
+@@ -750,6 +769,21 @@ Java_org_videolan_Libbluray_methods[] =
+         CC("(JI)J"),
+         VC(Java_org_videolan_Libbluray_presentationInfoN),
+     },
++    {
++        CC("discTimeNanosN"),
++        CC("()J"),
++        VC(Java_org_videolan_Libbluray_discTimeNanosN),
++    },
++    {
++        CC("discTimeAtN"),
++        CC("(J)J"),
++        VC(Java_org_videolan_Libbluray_discTimeAtN),
++    },
++    {
++        CC("discTimeMillisN"),
++        CC("()J"),
++        VC(Java_org_videolan_Libbluray_discTimeMillisN),
++    },
+     {
+         CC("selectRateN"),
+         CC("(JFI)I"),
+diff --git a/src/libbluray/bdj/native/org_videolan_Libbluray.h b/src/libbluray/bdj/native/org_videolan_Libbluray.h
+index 25557b7a..971bbb97 100644
+--- a/src/libbluray/bdj/native/org_videolan_Libbluray.h
++++ b/src/libbluray/bdj/native/org_videolan_Libbluray.h
+@@ -196,6 +196,30 @@ JNIEXPORT jint JNICALL Java_org_videolan_Libbluray_soundEffectN
+ JNIEXPORT jlong JNICALL Java_org_videolan_Libbluray_presentationInfoN
+   (JNIEnv *, jclass, jlong, jint);
+ 
++/*
++ * Class:     org_videolan_Libbluray
++ * Method:    discTimeNanosN
++ * Signature: ()J
++ */
++JNIEXPORT jlong JNICALL Java_org_videolan_Libbluray_discTimeNanosN
++  (JNIEnv *, jclass);
++
++/*
++ * Class:     org_videolan_Libbluray
++ * Method:    discTimeAtN
++ * Signature: (J)J
++ */
++JNIEXPORT jlong JNICALL Java_org_videolan_Libbluray_discTimeAtN
++  (JNIEnv *, jclass, jlong);
++
++/*
++ * Class:     org_videolan_Libbluray
++ * Method:    discTimeMillisN
++ * Signature: ()J
++ */
++JNIEXPORT jlong JNICALL Java_org_videolan_Libbluray_discTimeMillisN
++  (JNIEnv *, jclass);
++
+ /*
+  * Class:     org_videolan_Libbluray
+  * Method:    tellTimeN
+diff --git a/src/libbluray/bluray.c b/src/libbluray/bluray.c
+index 8ca289b4..10691c5f 100644
+--- a/src/libbluray/bluray.c
++++ b/src/libbluray/bluray.c
+@@ -35,6 +35,7 @@
+ #include "util/logging.h"
+ #include "util/strutl.h"
+ #include "util/mutex.h"
++#include "util/time.h"
+ #include "bdnav/bdid_parse.h"
+ #include "bdnav/clpi_data.h"
+ #include "bdnav/navigation.h"
+@@ -3500,6 +3501,20 @@ void bd_free_title_info(BLURAY_TITLE_INFO *title_info)
+  * player settings
+  */
+ 
++/*
++ * disc time
++ */
++
++void bd_disc_clock_start(void)
++{
++    disc_clock_start();
++}
++
++void bd_disc_clock_set(int running, int64_t at_mono_ns)
++{
++    disc_clock_set(running, at_mono_ns);
++}
++
+ int bd_set_player_setting(BLURAY *bd, uint32_t idx, uint32_t value)
+ {
+     static const struct { uint32_t idx; uint32_t  psr; } map[] = {
+@@ -3546,6 +3561,15 @@ int bd_set_player_setting(BLURAY *bd, uint32_t idx, uint32_t value)
+         return 1;
+     }
+ 
++    if (idx == BLURAY_PLAYER_SETTING_DISC_TIME_OFF) {
++        if (bd->title_type != title_undef) {
++            BD_DEBUG(DBG_BLURAY | DBG_CRIT, "Can't change disc time off during playback\n");
++            return 0;
++        }
++        disc_clock_set_off(!!value);
++        return 1;
++    }
++
+     if (idx == BLURAY_PLAYER_SETTING_UO_RESTRICTION_LEVEL) {
+         if (BLURAY_PLAYER_SETTING_UO_RESTRICTION_COMPLIANT < value) {
+             BD_DEBUG(DBG_BLURAY | DBG_CRIT, "Invalid UO restriction level\n");
+diff --git a/src/libbluray/bluray.h b/src/libbluray/bluray.h
+index b9988fbf..47ef4f0b 100644
+--- a/src/libbluray/bluray.h
++++ b/src/libbluray/bluray.h
+@@ -773,6 +773,7 @@ typedef enum {
+     BLURAY_PLAYER_SETTING_DECODE_PG            = 0x100, /**< Enable/disable PG (subtitle) decoder. Integer. Default: disabled. */
+     BLURAY_PLAYER_SETTING_PERSISTENT_STORAGE   = 0x101, /**< Enable/disable BD-J persistent storage. Integer. Default: enabled. */
+     BLURAY_PLAYER_SETTING_UO_RESTRICTION_LEVEL = 0x102, /**< Set User Operations (UO) restriction mask enforcement level. bd_player_setting_uo_restriction_level value. Default: BLURAY_PLAYER_SETTING_UO_RESTRICTION_RELAXED. */
++    BLURAY_PLAYER_SETTING_DISC_TIME_OFF        = 0x103, /**< Disc time never freezes, BD-J keeps wall time (process-wide; set before playback). Integer. Default: 0. */
+ 
+     BLURAY_PLAYER_PERSISTENT_ROOT              = 0x200, /**< Root path to the BD_J persistent storage location. String. */
+     BLURAY_PLAYER_CACHE_ROOT                   = 0x201, /**< Root path to the BD_J cache storage location. String. */
+@@ -1427,6 +1428,30 @@ BD_PUBLIC struct bd_file_s *bd_open_file_dec(BLURAY *bd, const char *path);
+  */
+ BD_PUBLIC struct mpls_pl *bd_get_title_mpls(BLURAY * bd);
+ 
++/*
++ * Disc time (phase 5).
++ *
++ * One process-wide clock that BD-J and the HDMV graphics controller use
++ * for their timers. It runs at 1x except while the player holds it
++ * frozen for an output change. Disc ns never go back, across discs too.
++ * BLURAY_PLAYER_SETTING_DISC_TIME_OFF makes it never freeze and keeps
++ * BD-J on wall time.
++ */
++#define BD_DISC_CLOCK 1
++
++/**
++ *  A playback open: records the disc start (wall time for BD-J millis)
++ *  and runs the clock at now. Not for directory listing or probing opens.
++ */
++BD_PUBLIC void     bd_disc_clock_start(void);
++
++/**
++ *  Freeze the clock at now (running = 0), or run it from at_mono_ns
++ *  (CLOCK_MONOTONIC ns; 0 = now; a past instant runs at now). A future
++ *  run instant keeps the clock frozen until that instant.
++ */
++BD_PUBLIC void     bd_disc_clock_set(int running, int64_t at_mono_ns);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/libbluray/decoders/graphics_controller.c b/src/libbluray/decoders/graphics_controller.c
+index fe520a96..ab0ecc15 100644
+--- a/src/libbluray/decoders/graphics_controller.c
++++ b/src/libbluray/decoders/graphics_controller.c
+@@ -357,7 +357,7 @@ static void _reset_user_timeout(GRAPHICS_CONTROLLER *gc)
+ 
+         gc->user_timeout = gc->igs->ics->interactive_composition.user_timeout_duration;
+         if (gc->user_timeout) {
+-            gc->user_timeout += bd_get_scr();
++            gc->user_timeout += disc_time_90k();
+         }
+     }
+ }
+@@ -692,7 +692,7 @@ static void _select_button(GRAPHICS_CONTROLLER *gc, uint32_t button_id)
+     page = _find_page(&gc->igs->ics->interactive_composition, page_id);
+     if (page && _find_button_page(page, button_id, &bog_idx)) {
+         gc->bog_data[bog_idx].animate_indx = 0;
+-        gc->next_effect_time = bd_get_scr();
++        gc->next_effect_time = disc_time_90k();
+     }
+ 
+     /* select page */
+@@ -717,14 +717,14 @@ static void _select_page(GRAPHICS_CONTROLLER *gc, uint16_t page_id, int out_effe
+     if (out_effects) {
+         page = _find_page(&gc->igs->ics->interactive_composition, cur_page_id);
+         if (page && page->out_effects.num_effects) {
+-            gc->next_effect_time = bd_get_scr();
++            gc->next_effect_time = disc_time_90k();
+             gc->out_effects = &page->out_effects;
+         }
+     }
+ 
+     page = _find_page(&gc->igs->ics->interactive_composition, page_id);
+     if (page && page->in_effects.num_effects) {
+-        gc->next_effect_time = bd_get_scr();
++        gc->next_effect_time = disc_time_90k();
+         gc->in_effects = &page->in_effects;
+     }
+ 
+@@ -1879,7 +1879,7 @@ static int _animate(GRAPHICS_CONTROLLER *gc, GC_NAV_CMDS *cmds)
+         result = 0;
+ 
+         if (gc->out_effects) {
+-            int64_t pts = bd_get_scr();
++            int64_t pts = disc_time_90k();
+             int64_t duration = (int64_t)gc->out_effects->effect[gc->effect_idx].duration;
+             if (pts >= (gc->next_effect_time + duration)) {
+                 gc->next_effect_time += duration;
+@@ -1892,7 +1892,7 @@ static int _animate(GRAPHICS_CONTROLLER *gc, GC_NAV_CMDS *cmds)
+                 result = _render_page(gc, 0xffff, cmds);
+             }
+         } else if (gc->in_effects) {
+-            int64_t pts = bd_get_scr();
++            int64_t pts = disc_time_90k();
+             int64_t duration = (int64_t)gc->in_effects->effect[gc->effect_idx].duration;
+             if (pts >= (gc->next_effect_time + duration)) {
+                 gc->next_effect_time += duration;
+@@ -1906,7 +1906,7 @@ static int _animate(GRAPHICS_CONTROLLER *gc, GC_NAV_CMDS *cmds)
+             }
+ 
+         } else if (gc->button_animation_running) {
+-            int64_t pts = bd_get_scr();
++            int64_t pts = disc_time_90k();
+             if (pts >= (gc->next_effect_time + gc->frame_interval)) {
+                 gc->next_effect_time += gc->frame_interval;
+                 result = _render_page(gc, 0xffff, cmds);
+@@ -1926,7 +1926,7 @@ static int _run_timers(GRAPHICS_CONTROLLER *gc, GC_NAV_CMDS *cmds)
+         result = 0;
+ 
+         if (gc->user_timeout) {
+-            int64_t pts = bd_get_scr();
++            int64_t pts = disc_time_90k();
+             if (pts > gc->user_timeout) {
+ 
+                 GC_TRACE("user timeout expired\n");
+diff --git a/src/util/time.c b/src/util/time.c
+index e0480c50..18f65ed1 100644
+--- a/src/util/time.c
++++ b/src/util/time.c
+@@ -23,6 +23,9 @@
+ 
+ #include "time.h"
+ 
++#include "logging.h"
++
++#include <inttypes.h>
+ #include <stdint.h>
+ 
+ #if defined(_WIN32)
+@@ -73,3 +76,340 @@ uint64_t bd_get_scr(void)
+ 
+     return now - t0;
+ }
++
++/*
++ * Disc time (phase 5, step 5.D).
++ *
++ * One process-lifetime clock: one disc plays at a time, and lingering
++ * xlet threads may read it after bd_close(), so it lives in static
++ * storage, not in the BLURAY object.
++ *
++ * disc ns is defined from the first use in the process and never goes
++ * back: a disc start records the disc ns and the wall time at that
++ * instant (for millis) but does not reset the disc ns.
++ *
++ * The value at CLOCK_MONOTONIC instant t is
++ *     anchor_disc + (running ? max(0, t - anchor_mono) : 0)
++ * so a run anchor in the future keeps disc time frozen until that
++ * instant and starts it exactly there.
++ *
++ * Every write also records a segment {from_mono, anchor_mono, anchor_disc,
++ * running} in a ring of the last DC_SEGMENTS (from_mono = the write's
++ * instant), so disc_time_at(t) for an instant before the latest write is
++ * evaluated against the segment that was in force at t (the latest whose
++ * from_mono <= t). Instants older than the ring use the oldest segment
++ * (counted, DISCDIAG).
++ *
++ * Locking rule: the clock mutex guards a copy of a few words only.
++ * Nothing calls into Java, logs, or takes another lock while holding it
++ * (readers include every xlet thread and the graphics controller under
++ * bd->mutex; the writer is the player's leaf owner).
++ */
++
++#if defined(_WIN32)
++static SRWLOCK _dc_lock = SRWLOCK_INIT;
++#  define DC_LOCK()   AcquireSRWLockExclusive(&_dc_lock)
++#  define DC_UNLOCK() ReleaseSRWLockExclusive(&_dc_lock)
++
++static int64_t _mono_ns(void)
++{
++    LARGE_INTEGER frequency, counter;
++    QueryPerformanceFrequency(&frequency);
++    QueryPerformanceCounter(&counter);
++    return (int64_t)((double)counter.QuadPart * 1e9 / (double)frequency.QuadPart);
++}
++
++static int64_t _wall_ms(void)
++{
++    FILETIME ft;
++    GetSystemTimeAsFileTime(&ft);
++    uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
++    return (int64_t)(t / 10000) - INT64_C(11644473600000);
++}
++#else
++#  include <pthread.h>
++#  include <time.h>
++static pthread_mutex_t _dc_lock = PTHREAD_MUTEX_INITIALIZER;
++#  define DC_LOCK()   pthread_mutex_lock(&_dc_lock)
++#  define DC_UNLOCK() pthread_mutex_unlock(&_dc_lock)
++
++static int64_t _mono_ns(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (int64_t)ts.tv_sec * INT64_C(1000000000) + ts.tv_nsec;
++}
++
++static int64_t _wall_ms(void)
++{
++    struct timeval tv;
++    gettimeofday(&tv, 0);
++    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
++}
++#endif
++
++#define DC_SEGMENTS 8
++
++typedef struct {
++    int64_t from_mono_ns;           /* in force from this instant (the write) */
++    int64_t anchor_mono_ns;
++    int64_t anchor_disc_ns;
++    int     running;
++} DC_SEGMENT;
++
++static struct {
++    int      initialized;
++    int      running;
++    int      off;                   /* disctime_off: never freezes */
++    uint32_t generation;            /* bumped at every write */
++    int64_t  anchor_mono_ns;        /* CLOCK_MONOTONIC */
++    int64_t  anchor_disc_ns;
++    int64_t  disc_ns_at_disc_start;
++    int64_t  wall_ms_at_disc_start;
++
++    DC_SEGMENT seg[DC_SEGMENTS];    /* ring, seg[seg_head] = the current one */
++    unsigned   seg_head;
++    unsigned   seg_count;
++    uint32_t   older_than_ring;     /* DISCDIAG TEMP: disc_time_at() before the ring */
++} _dc;
++
++/* call with the clock mutex held, after every write of the anchor */
++static void _dc_push_locked(int64_t from_mono_ns)
++{
++    DC_SEGMENT *s;
++
++    if (_dc.seg_count) {
++        _dc.seg_head = (_dc.seg_head + 1) % DC_SEGMENTS;
++    }
++    if (_dc.seg_count < DC_SEGMENTS) {
++        _dc.seg_count++;
++    }
++    s = &_dc.seg[_dc.seg_head];
++    s->from_mono_ns   = from_mono_ns;
++    s->anchor_mono_ns = _dc.anchor_mono_ns;
++    s->anchor_disc_ns = _dc.anchor_disc_ns;
++    s->running        = _dc.running;
++}
++
++static int64_t _dc_seg_value(const DC_SEGMENT *s, int64_t mono_ns)
++{
++    int64_t d;
++
++    if (!s->running) {
++        return s->anchor_disc_ns;
++    }
++    d = mono_ns - s->anchor_mono_ns;
++    return s->anchor_disc_ns + (d > 0 ? d : 0);
++}
++
++/* call with the clock mutex held: the value at an instant, past ones
++ * against the segment in force then; *older set when before the ring */
++static int64_t _dc_value_at_locked(int64_t mono_ns, int *older)
++{
++    unsigned i, idx = _dc.seg_head;
++
++    for (i = 0; i < _dc.seg_count; i++) {
++        idx = (_dc.seg_head + DC_SEGMENTS - i) % DC_SEGMENTS;
++        if (_dc.seg[idx].from_mono_ns <= mono_ns) {
++            return _dc_seg_value(&_dc.seg[idx], mono_ns);
++        }
++    }
++    /* before the oldest segment: use it */
++    *older = 1;
++    return _dc_seg_value(&_dc.seg[idx], mono_ns);
++}
++
++/* call with the clock mutex held */
++static void _dc_init_locked(int64_t now)
++{
++    if (!_dc.initialized) {
++        _dc.initialized           = 1;
++        _dc.running               = 1;
++        _dc.anchor_mono_ns        = now;
++        _dc.anchor_disc_ns        = 0;
++        _dc.disc_ns_at_disc_start = 0;
++        _dc.wall_ms_at_disc_start = _wall_ms();
++        _dc_push_locked(now);
++    }
++}
++
++/* call with the clock mutex held */
++static int64_t _dc_value_locked(int64_t mono_ns)
++{
++    int64_t d;
++
++    if (!_dc.running) {
++        return _dc.anchor_disc_ns;
++    }
++    d = mono_ns - _dc.anchor_mono_ns;
++    return _dc.anchor_disc_ns + (d > 0 ? d : 0);
++}
++
++int64_t disc_clock_mono_ns(void)
++{
++    return _mono_ns();
++}
++
++void disc_clock_start(void)
++{
++    int64_t now  = _mono_ns();
++    int64_t wall = _wall_ms();
++    int64_t v, cur_ms, wall_start;
++    int     was_running, off;
++    uint32_t gen;
++
++    DC_LOCK();
++    _dc_init_locked(now);
++    was_running = _dc.running;
++    v = _dc_value_locked(now);
++    /* millis never go back across discs, even with the wall clock
++     * stepped back between them */
++    cur_ms = _dc.wall_ms_at_disc_start + (v - _dc.disc_ns_at_disc_start) / 1000000;
++    wall_start = wall > cur_ms ? wall : cur_ms;
++    _dc.anchor_disc_ns        = v;
++    _dc.anchor_mono_ns        = now;
++    _dc.running               = 1;
++    _dc.disc_ns_at_disc_start = v;
++    _dc.wall_ms_at_disc_start = wall_start;
++    _dc_push_locked(now);
++    gen = ++_dc.generation;
++    off = _dc.off;
++    DC_UNLOCK();
++
++    /* DISCDIAG TEMP */
++    BD_DEBUG(DBG_BLURAY | DBG_CRIT,
++             "DISCDIAG TEMP start: disc=%" PRId64 " ms wall=%" PRId64 " ms millis_start=%" PRId64 " ms was_running=%d off=%d gen=%u\n",
++             v / 1000000, wall, wall_start, was_running, off, (unsigned)gen);
++}
++
++void disc_clock_set(int running, int64_t at_mono_ns)
++{
++    int64_t now = _mono_ns();
++    int64_t at  = at_mono_ns > 0 ? at_mono_ns : now;
++    int64_t v, eff = now;
++    int     was_running, ignored = 0;
++    uint32_t gen;
++
++    DC_LOCK();
++    _dc_init_locked(now);
++    was_running = _dc.running;
++    v = _dc_value_locked(now);
++    if (!running && _dc.off) {
++        ignored = 1;
++    } else if (!running) {
++        /* a freeze is at now: never back-dated, never in the future */
++        _dc.anchor_disc_ns = v;
++        _dc.anchor_mono_ns = now;
++        _dc.running        = 0;
++    } else {
++        /* a run anchor is never in the past (that would erase a freeze) */
++        eff = at > now ? at : now;
++        _dc.anchor_disc_ns = v;
++        _dc.anchor_mono_ns = eff;
++        _dc.running        = 1;
++    }
++    if (!ignored) {
++        _dc_push_locked(now);
++    }
++    gen = ignored ? _dc.generation : ++_dc.generation;
++    DC_UNLOCK();
++
++    /* DISCDIAG TEMP */
++    BD_DEBUG(DBG_BLURAY | DBG_CRIT,
++             "DISCDIAG TEMP set: %s at %+" PRId64 " us from now (asked %+" PRId64 "), disc=%" PRId64 " ms was_running=%d%s gen=%u\n",
++             running ? "RUN" : "FREEZE", (eff - now) / 1000, (at - now) / 1000, v / 1000000, was_running,
++             ignored ? " IGNORED(off)" : "", (unsigned)gen);
++}
++
++void disc_clock_set_off(int off)
++{
++    int changed;
++
++    DC_LOCK();
++    changed = _dc.off != !!off;
++    _dc.off = !!off;
++    if (_dc.off && _dc.initialized && !_dc.running) {
++        /* off never freezes: resume at now */
++        int64_t now = _mono_ns();
++        _dc.anchor_disc_ns = _dc_value_locked(now);
++        _dc.anchor_mono_ns = now;
++        _dc.running        = 1;
++        _dc_push_locked(now);
++        _dc.generation++;
++    }
++    DC_UNLOCK();
++
++    if (changed) {
++        /* DISCDIAG TEMP */
++        BD_DEBUG(DBG_BLURAY | DBG_CRIT, "DISCDIAG TEMP off=%d\n", !!off);
++    }
++}
++
++int disc_clock_off(void)
++{
++    int off;
++
++    DC_LOCK();
++    off = _dc.off;
++    DC_UNLOCK();
++
++    return off;
++}
++
++int64_t disc_time_at(int64_t mono_ns)
++{
++    int64_t v;
++    int     older = 0;
++    uint32_t n = 0;
++
++    DC_LOCK();
++    _dc_init_locked(_mono_ns());
++    v = _dc_value_at_locked(mono_ns, &older);
++    if (older) {
++        n = ++_dc.older_than_ring;
++    }
++    DC_UNLOCK();
++
++    if (older) {
++        /* DISCDIAG TEMP */
++        BD_DEBUG(DBG_BLURAY | DBG_CRIT,
++                 "DISCDIAG TEMP disc_time_at: instant older than the last %d clock writes, oldest segment used (count %u)\n",
++                 DC_SEGMENTS, (unsigned)n);
++    }
++    return v;
++}
++
++int64_t disc_time_ns(void)
++{
++    int64_t now = _mono_ns();
++    int64_t v;
++
++    DC_LOCK();
++    _dc_init_locked(now);
++    v = _dc_value_locked(now);
++    DC_UNLOCK();
++
++    return v;
++}
++
++int64_t disc_time_millis(void)
++{
++    int64_t now = _mono_ns();
++    int64_t ms;
++
++    DC_LOCK();
++    _dc_init_locked(now);
++    ms = _dc.wall_ms_at_disc_start +
++         (_dc_value_locked(now) - _dc.disc_ns_at_disc_start) / 1000000;
++    DC_UNLOCK();
++
++    return ms;
++}
++
++uint64_t disc_time_90k(void)
++{
++    if (disc_clock_off()) {
++        return bd_get_scr();
++    }
++    return (uint64_t)(disc_time_ns() / 100000) * 9;
++}
+diff --git a/src/util/time.h b/src/util/time.h
+index 62a1fcb2..3d955243 100644
+--- a/src/util/time.h
++++ b/src/util/time.h
+@@ -26,4 +26,19 @@
+ 
+ BD_PRIVATE uint64_t bd_get_scr(void);
+ 
++/*
++ * Disc time (phase 5, step 5.D): a process-lifetime clock in
++ * CLOCK_MONOTONIC nanoseconds that runs at 1x except while the player
++ * holds it frozen for an output change. See time.c.
++ */
++BD_PRIVATE void     disc_clock_start(void);                 /* a playback open */
++BD_PRIVATE void     disc_clock_set(int running, int64_t at_mono_ns); /* 0 = now */
++BD_PRIVATE void     disc_clock_set_off(int off);
++BD_PRIVATE int      disc_clock_off(void);
++BD_PRIVATE int64_t  disc_clock_mono_ns(void);               /* CLOCK_MONOTONIC now */
++BD_PRIVATE int64_t  disc_time_at(int64_t mono_ns);          /* disc ns at an instant */
++BD_PRIVATE int64_t  disc_time_ns(void);                     /* disc ns now */
++BD_PRIVATE int64_t  disc_time_millis(void);                 /* wall at disc start + disc ms */
++BD_PRIVATE uint64_t disc_time_90k(void);                    /* disc time, 90 kHz (bd_get_scr() when off) */
++
+ #endif // LIBBLURAY_TIME_H_
